@@ -13,7 +13,8 @@ name: aris-subset
 services:
   aris-subset:
     container_name: aris-subset
-    build: .
+    image: "${ARIS_IMAGE:-ghcr.io/arismaid/arissubset:latest}"
+    pull_policy: always
     restart: unless-stopped
     init: true
 
