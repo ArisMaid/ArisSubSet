@@ -1,0 +1,91 @@
+# ArisSubSet
+# 单容器字幕字体子集化服务，适合部署在 N100/NAS 这类低功耗 CPU 上。
+#
+# 首次部署：
+#   1. 准备目录：./Fonts、./watch、./backups、./data
+#   2. 生成密码哈希：
+#      python -c "import hashlib,getpass; print('sha256:' + hashlib.sha256(getpass.getpass().encode()).hexdigest())"
+#   3. 将 ADMIN_PASSWORD_HASH 替换为生成值。
+#   4. docker compose up -d --build
+
+name: aris-subset
+
+services:
+  aris-subset:
+    container_name: aris-subset
+    build: .
+    restart: unless-stopped
+    init: true
+
+    # NAS 上通常直接暴露到局域网即可；只想本机反代时改为 "127.0.0.1:8080:8080"。
+    ports:
+      - "${ARIS_HTTP_PORT:-8080}:8080"
+
+    environment:
+      # 必填：管理员密码哈希。仅在完全可信的本地调试环境才使用 ASS_SUBSET_ALLOW_NO_AUTH=1。
+      ADMIN_PASSWORD_HASH: "${ADMIN_PASSWORD_HASH:-sha256:REPLACE_WITH_SHA256_HEX}"
+
+      # 容器内固定目录；主机路径在 volumes 中配置。
+      FONT_DIRS: "/fonts"
+      WATCH_DIRS: "/watch"
+      BACKUP_DIR: "/backups"
+      DATA_DIR: "/data"
+      TZ: "${TZ:-Asia/Shanghai}"
+
+      # 定时扫描：支持 disabled、@every 30s、@every 15m、@every 1h。
+      SCAN_CRON: "${SCAN_CRON:-@every 1h}"
+
+      # N100 建议值：避免 fontTools 多进程把小主机打满。
+      MAX_CONCURRENT_JOBS: "${MAX_CONCURRENT_JOBS:-1}"
+      MAX_FONT_WORKERS: "${MAX_FONT_WORKERS:-2}"
+      MAX_INDEX_CONCURRENCY: "${MAX_INDEX_CONCURRENCY:-16}"
+      JOB_QUEUE_SIZE: "${JOB_QUEUE_SIZE:-256}"
+
+      # 默认不自动删除备份；需要保留策略时再显式设置天数。
+      BACKUP_RETENTION_DAYS: "${BACKUP_RETENTION_DAYS:-0}"
+
+      # 处理策略默认值。Web UI 中可以运行时切换，并会写入 /data 的 SQLite 配置。
+      EMBED_EXTERNAL_FONTS: "${EMBED_EXTERNAL_FONTS:-true}"
+      EMBED_SYSTEM_FONTS: "${EMBED_SYSTEM_FONTS:-false}"
+      INCLUDE_ASCII: "${INCLUDE_ASCII:-true}"
+      MULTI_WEIGHT: "${MULTI_WEIGHT:-true}"
+      RANDOMIZE_FONT_NAMES: "${RANDOMIZE_FONT_NAMES:-true}"
+      DRAW_SUBSET: "${DRAW_SUBSET:-true}"
+      FULL_FONT_EMBED: "${FULL_FONT_EMBED:-false}"
+      VARIABLE_FONTS: "${VARIABLE_FONTS:-false}"
+
+    volumes:
+      # 字体库建议只读挂载；可用 ARIS_FONT_DIR 指向 NAS 上的 60G 字体目录。
+      - "${ARIS_FONT_DIR:-./Fonts}:/fonts:ro"
+      # 字幕目录需要可写，因为服务会备份后原地替换已处理字幕。
+      - "${ARIS_WATCH_DIR:-./watch}:/watch"
+      # 原字幕备份目录。
+      - "${ARIS_BACKUP_DIR:-./backups}:/backups"
+      # SQLite、字体子集缓存、运行时配置。
+      - "${ARIS_DATA_DIR:-./data}:/data"
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/status', timeout=5).read()",
+        ]
+      interval: 30s
+      timeout: 8s
+      retries: 3
+      start_period: 30s
+
+    # 防止异常任务无限制消耗 NAS 资源；如字体索引很慢，可适当调高 nofile。
+    pids_limit: 512
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
