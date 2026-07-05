@@ -143,7 +143,8 @@ h2 {
 .cron-input::after,
 .file-picker::after,
 .mini-icon::after,
-.icon-link::after {
+.icon-link::after,
+.stepper::after {
   position: absolute;
   z-index: 20;
   bottom: calc(100% + 9px);
@@ -173,7 +174,8 @@ h2 {
 .cron-input:hover::after,
 .file-picker:hover::after,
 .mini-icon:hover::after,
-.icon-link:hover::after {
+.icon-link:hover::after,
+.stepper:hover::after {
   opacity: 1;
   transform: translate(-50%, 0);
 }
@@ -184,7 +186,8 @@ h2 {
 .cron-input:not([data-tooltip])::after,
 .file-picker:not([data-tooltip])::after,
 .mini-icon:not([data-tooltip])::after,
-.icon-link:not([data-tooltip])::after {
+.icon-link:not([data-tooltip])::after,
+.stepper:not([data-tooltip])::after {
   display: none;
 }
 
@@ -202,6 +205,53 @@ h2 {
 .icon-button[data-danger="true"] {
   color: #7d241f;
   border-color: rgba(125, 36, 31, 0.24);
+}
+
+.stepper {
+  position: relative;
+  display: inline-grid;
+  grid-template-columns: 34px minmax(34px, auto) 34px;
+  min-height: 38px;
+  overflow: hidden;
+  border: 1px solid rgba(28, 58, 45, 0.14);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.68);
+  box-shadow: 0 8px 22px rgba(31, 61, 48, 0.1);
+}
+
+.stepper button {
+  border: 0;
+  color: #173127;
+  background: transparent;
+  font-size: 1rem;
+  font-weight: 800;
+}
+
+.stepper span {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 34px;
+  padding: 0 8px;
+  color: #173127;
+  font-weight: 800;
+}
+
+.stepper-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.stepper-label {
+  color: #607168;
+  font-size: 0.88rem;
+  font-weight: 800;
+}
+
+.stepper button:disabled {
+  cursor: not-allowed;
+  opacity: 0.42;
 }
 
 .spin {
@@ -723,6 +773,11 @@ td small {
   color: #9c342d;
 }
 
+td small.error-text {
+  max-width: 620px;
+  overflow-wrap: anywhere;
+}
+
 tr:last-child td {
   border-bottom: 0;
 }
@@ -762,6 +817,10 @@ tr:last-child td {
 .status-badge[data-status="running"],
 .status-badge[data-status="queued"] {
   color: #7b6231;
+}
+
+.status-badge[data-status="cancelled"] {
+  color: #607168;
 }
 
 .icon-link {

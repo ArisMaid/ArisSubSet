@@ -88,7 +88,7 @@ pub struct SubsetRequest<'a> {
     pub randomize_map: Option<RandomizeMap<'a>>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize)]
 pub struct RandomizeMap<'a> {
     pub original: &'a str,
     pub subset: &'a str,

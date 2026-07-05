@@ -21,6 +21,20 @@ pub struct AppState {
     pub sessions: RwLock<HashMap<String, Session>>,
     runtime_options: RwLock<ProcessingOptions>,
     scan_interval: RwLock<Duration>,
+    conversion_parallelism: RwLock<usize>,
+    scan_paused: RwLock<bool>,
+    scan_cancel_requested: RwLock<bool>,
+    conversion_paused: RwLock<bool>,
+    conversion_cancel_requested: RwLock<bool>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ControlStatus {
+    pub scan_paused: bool,
+    pub scan_cancel_requested: bool,
+    pub conversion_paused: bool,
+    pub conversion_cancel_requested: bool,
+    pub conversion_parallelism: usize,
 }
 
 impl AppState {
@@ -33,6 +47,7 @@ impl AppState {
     ) -> Self {
         let runtime_options = config.options.clone();
         let scan_interval = config.scan_interval;
+        let conversion_parallelism = config.max_concurrent_jobs;
         Self {
             config,
             db,
@@ -42,6 +57,11 @@ impl AppState {
             sessions: RwLock::new(HashMap::new()),
             runtime_options: RwLock::new(runtime_options),
             scan_interval: RwLock::new(scan_interval),
+            conversion_parallelism: RwLock::new(conversion_parallelism),
+            scan_paused: RwLock::new(false),
+            scan_cancel_requested: RwLock::new(false),
+            conversion_paused: RwLock::new(false),
+            conversion_cancel_requested: RwLock::new(false),
         }
     }
 
@@ -55,6 +75,11 @@ impl AppState {
             && let Ok(seconds) = raw.parse::<u64>()
         {
             *self.scan_interval.write().await = Duration::from_secs(seconds);
+        }
+        if let Some(raw) = self.setting("conversion_parallelism").await?
+            && let Ok(value) = raw.parse::<usize>()
+        {
+            *self.conversion_parallelism.write().await = value.clamp(1, 32);
         }
         Ok(())
     }
@@ -82,6 +107,7 @@ impl AppState {
                 "randomize_font_names" => options.randomize_font_names = value,
                 "draw_subset" => options.draw_subset = value,
                 "full_font_embed" => options.full_font_embed = value,
+                "fallback_full_font_embed" => options.fallback_full_font_embed = value,
                 "variable_fonts" => options.variable_fonts = value,
                 _ => anyhow::bail!("unknown processing option: {key}"),
             }
@@ -100,6 +126,80 @@ impl AppState {
         *self.scan_interval.write().await = interval;
         self.save_setting("scan_interval_seconds", &interval.as_secs().to_string())
             .await
+    }
+
+    pub async fn controls(&self) -> ControlStatus {
+        ControlStatus {
+            scan_paused: *self.scan_paused.read().await,
+            scan_cancel_requested: *self.scan_cancel_requested.read().await,
+            conversion_paused: *self.conversion_paused.read().await,
+            conversion_cancel_requested: *self.conversion_cancel_requested.read().await,
+            conversion_parallelism: *self.conversion_parallelism.read().await,
+        }
+    }
+
+    pub async fn conversion_parallelism(&self) -> usize {
+        *self.conversion_parallelism.read().await
+    }
+
+    pub async fn set_conversion_parallelism(&self, value: usize) -> anyhow::Result<usize> {
+        let value = value.clamp(1, 32);
+        *self.conversion_parallelism.write().await = value;
+        self.save_setting("conversion_parallelism", &value.to_string())
+            .await?;
+        Ok(value)
+    }
+
+    pub async fn set_scan_paused(&self, paused: bool) {
+        *self.scan_paused.write().await = paused;
+        if !paused {
+            *self.scan_cancel_requested.write().await = false;
+        }
+    }
+
+    pub async fn request_scan_cancel(&self) {
+        *self.scan_cancel_requested.write().await = true;
+        *self.scan_paused.write().await = false;
+    }
+
+    pub async fn clear_scan_cancel(&self) {
+        *self.scan_cancel_requested.write().await = false;
+    }
+
+    pub async fn wait_for_scan_turn(&self) -> bool {
+        loop {
+            if *self.scan_cancel_requested.read().await {
+                return false;
+            }
+            if !*self.scan_paused.read().await {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    pub async fn set_conversion_paused(&self, paused: bool) {
+        *self.conversion_paused.write().await = paused;
+        if !paused {
+            *self.conversion_cancel_requested.write().await = false;
+        }
+    }
+
+    pub async fn request_conversion_cancel(&self) {
+        *self.conversion_cancel_requested.write().await = true;
+        *self.conversion_paused.write().await = false;
+    }
+
+    pub async fn clear_conversion_cancel(&self) {
+        *self.conversion_cancel_requested.write().await = false;
+    }
+
+    pub async fn conversion_cancel_requested(&self) -> bool {
+        *self.conversion_cancel_requested.read().await
+    }
+
+    pub async fn conversion_paused(&self) -> bool {
+        *self.conversion_paused.read().await
     }
 
     async fn setting(&self, key: &str) -> anyhow::Result<Option<String>> {

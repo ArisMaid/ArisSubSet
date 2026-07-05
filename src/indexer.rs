@@ -45,6 +45,7 @@ pub struct IndexSummary {
     pub skipped: usize,
     pub failed: usize,
     pub fallback_used: usize,
+    pub pruned: usize,
     pub walk_ms: u128,
     pub inspect_ms: u128,
     pub write_ms: u128,
@@ -98,6 +99,7 @@ pub async fn rebuild_index(state: Arc<AppState>) -> anyhow::Result<IndexSummary>
     let existing = load_existing_font_meta(&state).await?;
     let mut summary = IndexSummary::default();
     let mut changed = Vec::new();
+    let mut seen = HashSet::new();
     let walk_started = Instant::now();
 
     for root in &state.config.font_dirs {
@@ -130,6 +132,7 @@ pub async fn rebuild_index(state: Arc<AppState>) -> anyhow::Result<IndexSummary>
                     continue;
                 }
             };
+            seen.insert(meta.path_s.clone());
             if let Some(old) = existing.get(&meta.path_s) {
                 if old.size == meta.size && old.mtime == meta.mtime && old.status == "ok" {
                     summary.skipped += 1;
@@ -147,6 +150,9 @@ pub async fn rebuild_index(state: Arc<AppState>) -> anyhow::Result<IndexSummary>
     summary.inspect_ms = inspect_started.elapsed().as_millis();
     let write_started = Instant::now();
     write_index_results(&state, indexed, failed).await?;
+    if !seen.is_empty() {
+        summary.pruned = prune_stale_fonts(&state, &existing, &seen).await?;
+    }
     summary.write_ms = write_started.elapsed().as_millis();
     Ok(summary)
 }
@@ -170,6 +176,41 @@ async fn load_existing_font_meta(
         );
     }
     Ok(out)
+}
+
+async fn prune_stale_fonts(
+    state: &Arc<AppState>,
+    existing: &HashMap<String, ExistingMeta>,
+    seen: &HashSet<String>,
+) -> anyhow::Result<usize> {
+    let stale_ids: Vec<i64> = existing
+        .iter()
+        .filter(|(path, _)| !seen.contains(*path))
+        .map(|(_, meta)| meta.id)
+        .collect();
+    if stale_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let mut pruned = 0usize;
+    for chunk in stale_ids.chunks(500) {
+        let mut qb = QueryBuilder::new("DELETE FROM font_files WHERE id IN (");
+        let mut separated = qb.separated(", ");
+        for id in chunk {
+            separated.push_bind(id);
+        }
+        separated.push_unseparated(")");
+        let result = qb.build().execute(&state.db.pool).await?;
+        pruned += result.rows_affected() as usize;
+    }
+    if pruned > 0 {
+        state.events.emit(
+            "index",
+            "info",
+            format!("pruned stale font index rows: {pruned}"),
+        );
+    }
+    Ok(pruned)
 }
 
 async fn inspect_changed_fonts(

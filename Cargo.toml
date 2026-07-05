@@ -1,6 +1,6 @@
 [package]
 name = "ass-subset-service"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 
@@ -11,6 +11,7 @@ axum = { version = "0.8", features = ["macros", "multipart"] }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 fs2 = "0.4"
+filetime = "0.2"
 futures-core = "0.3"
 hex = "0.4"
 memmap2 = "0.9"

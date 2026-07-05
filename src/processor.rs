@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -6,11 +6,13 @@ use std::sync::Arc;
 use anyhow::{Context, bail};
 use base64::{Engine, engine::general_purpose};
 use chrono::Utc;
+use filetime::{FileTime, set_file_mtime};
 use fs2::FileExt;
 use rand::{Rng, distributions::Uniform};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 use tokio::sync::{Semaphore, mpsc};
+use tokio::task::JoinSet;
 use uuid::Uuid;
 
 use crate::ass::{
@@ -23,6 +25,7 @@ use crate::font_worker::{DrawFontRequest, RandomizeMap, SubsetRequest};
 use crate::models::{EmbeddedFont, FontCandidate, FontSlot, JobMode};
 use crate::state::AppState;
 
+#[allow(dead_code)]
 pub fn spawn_job_loop(mut rx: mpsc::Receiver<i64>, state: Arc<AppState>) {
     tokio::spawn(async move {
         let sem = Arc::new(Semaphore::new(state.config.max_concurrent_jobs));
@@ -43,6 +46,88 @@ pub fn spawn_job_loop(mut rx: mpsc::Receiver<i64>, state: Arc<AppState>) {
             });
         }
     });
+}
+
+pub fn spawn_controlled_job_loop(mut rx: mpsc::Receiver<i64>, state: Arc<AppState>) {
+    tokio::spawn(async move {
+        let mut pending = VecDeque::new();
+        let mut active = JoinSet::new();
+        loop {
+            tokio::select! {
+                received = rx.recv() => {
+                    if let Some(job_id) = received {
+                        pending.push_back(job_id);
+                    } else if pending.is_empty() && active.is_empty() {
+                        break;
+                    }
+                }
+                Some(_) = active.join_next(), if !active.is_empty() => {}
+                _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+            }
+
+            if state.conversion_cancel_requested().await {
+                while let Some(job_id) = pending.pop_front() {
+                    let _ = cancel_job(&state, job_id, "cancelled before start").await;
+                }
+                let _ = cancel_queued_jobs(&state).await;
+                if active.is_empty() {
+                    state.clear_conversion_cancel().await;
+                }
+                continue;
+            }
+
+            if state.conversion_paused().await {
+                continue;
+            }
+
+            let limit = state.conversion_parallelism().await;
+            while active.len() < limit {
+                let Some(job_id) = pending.pop_front() else {
+                    break;
+                };
+                if !job_is_runnable(&state, job_id).await.unwrap_or(false) {
+                    continue;
+                }
+                let st = state.clone();
+                active.spawn(async move {
+                    if let Err(err) = process_job(st.clone(), job_id).await {
+                        if st.conversion_cancel_requested().await {
+                            let _ = cancel_job(&st, job_id, "cancelled while running").await;
+                        } else {
+                            st.events
+                                .emit("job", "err", format!("job #{job_id} failed: {err:#}"));
+                            let _ = fail_job(&st, job_id, &format!("{err:#}")).await;
+                        }
+                    }
+                });
+            }
+        }
+    });
+}
+
+pub async fn recover_incomplete_jobs(state: Arc<AppState>) -> anyhow::Result<usize> {
+    sqlx::query("UPDATE jobs SET status='queued', started_at=NULL WHERE status='running'")
+        .execute(&state.db.pool)
+        .await?;
+    let rows = sqlx::query("SELECT id FROM jobs WHERE status='queued' ORDER BY id ASC")
+        .fetch_all(&state.db.pool)
+        .await?;
+    let mut count = 0usize;
+    for row in rows {
+        let job_id: i64 = row.get("id");
+        state
+            .job_tx
+            .send(job_id)
+            .await
+            .context("job queue closed")?;
+        count += 1;
+    }
+    if count > 0 {
+        state
+            .events
+            .emit("job", "info", format!("recovered queued jobs: {count}"));
+    }
+    Ok(count)
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -91,6 +176,9 @@ async fn process_subset_job(
         .events
         .emit("job", "info", format!("开始转换：{path}"));
 
+    if state.conversion_cancel_requested().await {
+        bail!("cancelled");
+    }
     let bytes = read_locked(&path_buf)?;
     let original_size = bytes.len() as u64;
     let decoded = decode_subtitle(&bytes)?;
@@ -102,6 +190,9 @@ async fn process_subset_job(
     let mut used_random_names = HashSet::new();
 
     for (font_name, usage) in parsed.usages.iter() {
+        if state.conversion_cancel_requested().await {
+            bail!("cancelled");
+        }
         let normalized = normalize_lookup_name(font_name);
         if normalized.starts_with("assdrawsubset") {
             continue;
@@ -173,6 +264,7 @@ async fn process_subset_job(
         write_replace(&path_buf, &final_bytes).await?;
     }
 
+    touch_processed_file(&path_buf).await?;
     let new_meta = tokio::fs::metadata(&path_buf).await?;
     let new_sha = sha256_file(&path_buf).await?;
     let status = if missing_fonts.is_empty() {
@@ -262,6 +354,9 @@ async fn process_strip_job(
         .events
         .emit("job", "info", format!("开始清理还原：{path}"));
 
+    if state.conversion_cancel_requested().await {
+        bail!("cancelled");
+    }
     let bytes = read_locked(&path_buf)?;
     let original_size = bytes.len() as u64;
     let decoded = decode_subtitle(&bytes)?;
@@ -275,6 +370,9 @@ async fn process_strip_job(
     let mut warnings = Vec::new();
 
     for font in &embedded_fonts {
+        if state.conversion_cancel_requested().await {
+            bail!("cancelled");
+        }
         let mut removable = false;
         let family = embedded_family_name(&font.fontname);
         if comment_map.contains_key(&normalize_lookup_name(&family))
@@ -334,6 +432,7 @@ async fn process_strip_job(
         write_replace(&path_buf, &final_bytes).await?;
     }
 
+    touch_processed_file(&path_buf).await?;
     let new_meta = tokio::fs::metadata(&path_buf).await?;
     let new_sha = sha256_file(&path_buf).await?;
     let status = if warnings.is_empty() {
@@ -573,7 +672,29 @@ async fn subset_candidate(
             subfamily,
             randomize_map,
         };
-        state.workers.subset_font(&req).await?;
+        if let Err(err) = state.workers.subset_font(&req).await {
+            if options.full_font_embed || !options.fallback_full_font_embed {
+                return Err(err);
+            }
+            let fallback_req = SubsetRequest {
+                source_path: &candidate.path,
+                ttc_index: candidate.ttc_index,
+                output_path: &output_path_s,
+                codepoints,
+                include_ascii: options.include_ascii,
+                full_font: true,
+                target_family: embedded_name,
+                original_family: original_name,
+                subfamily,
+                randomize_map,
+            };
+            state.events.emit(
+                "job",
+                "warn",
+                format!("subset failed, retrying full embed for {original_name}: {err:#}"),
+            );
+            state.workers.subset_font(&fallback_req).await?;
+        }
     }
     let data = tokio::fs::read(&output_path).await.with_context(|| {
         format!(
@@ -757,6 +878,16 @@ async fn write_replace(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn touch_processed_file(path: &Path) -> anyhow::Result<()> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        set_file_mtime(&path, FileTime::now())
+            .with_context(|| format!("touch processed subtitle {}", path.display()))
+    })
+    .await
+    .context("touch processed subtitle task failed")?
+}
+
 fn read_locked(path: &Path) -> anyhow::Result<Vec<u8>> {
     let mut file = std::fs::OpenOptions::new()
         .read(true)
@@ -791,6 +922,36 @@ async fn fail_job(state: &Arc<AppState>, job_id: i64, error: &str) -> anyhow::Re
             .await?;
     }
     Ok(())
+}
+
+async fn cancel_job(state: &Arc<AppState>, job_id: i64, message: &str) -> anyhow::Result<()> {
+    let finished = Utc::now().to_rfc3339();
+    sqlx::query("UPDATE jobs SET status='cancelled', finished_at=?, message=? WHERE id=?")
+        .bind(&finished)
+        .bind(message)
+        .bind(job_id)
+        .execute(&state.db.pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn cancel_queued_jobs(state: &Arc<AppState>) -> anyhow::Result<u64> {
+    let finished = Utc::now().to_rfc3339();
+    let result = sqlx::query(
+        "UPDATE jobs SET status='cancelled', finished_at=?, message='cancelled before start' WHERE status='queued'",
+    )
+    .bind(finished)
+    .execute(&state.db.pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+async fn job_is_runnable(state: &Arc<AppState>, job_id: i64) -> anyhow::Result<bool> {
+    let status: Option<String> = sqlx::query_scalar("SELECT status FROM jobs WHERE id=?")
+        .bind(job_id)
+        .fetch_optional(&state.db.pool)
+        .await?;
+    Ok(matches!(status.as_deref(), Some("queued")))
 }
 
 fn random_font_name(used: &mut HashSet<String>) -> String {

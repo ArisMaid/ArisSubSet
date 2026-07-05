@@ -15,6 +15,7 @@ pub struct ProcessingOptions {
     pub randomize_font_names: bool,
     pub draw_subset: bool,
     pub full_font_embed: bool,
+    pub fallback_full_font_embed: bool,
     pub variable_fonts: bool,
 }
 
@@ -28,6 +29,7 @@ impl Default for ProcessingOptions {
             randomize_font_names: true,
             draw_subset: true,
             full_font_embed: false,
+            fallback_full_font_embed: true,
             variable_fonts: false,
         }
     }
@@ -104,6 +106,8 @@ impl Config {
             env_bool("RANDOMIZE_FONT_NAMES", options.randomize_font_names);
         options.draw_subset = env_bool("DRAW_SUBSET", options.draw_subset);
         options.full_font_embed = env_bool("FULL_FONT_EMBED", options.full_font_embed);
+        options.fallback_full_font_embed =
+            env_bool("FALLBACK_FULL_FONT_EMBED", options.fallback_full_font_embed);
         options.variable_fonts = env_bool("VARIABLE_FONTS", options.variable_fonts);
 
         Ok(Self {

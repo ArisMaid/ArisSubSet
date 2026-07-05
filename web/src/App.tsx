@@ -11,6 +11,7 @@ import {
   FolderPlus,
   KeyRound,
   Loader2,
+  Pause,
   Play,
   RefreshCw,
   RotateCcw,
@@ -44,6 +45,7 @@ const optionLabels: Record<string, string> = {
   randomize_font_names: "随机字体名",
   draw_subset: "绘图字体",
   full_font_embed: "完整嵌入",
+  fallback_full_font_embed: "失败回退",
   variable_fonts: "可变字体",
 };
 
@@ -55,6 +57,7 @@ const optionTips: Record<string, string> = {
   randomize_font_names: "使用随机字体名并写入可还原映射。",
   draw_subset: "把 ASS 绘图转换为可还原的 draw 表字体。",
   full_font_embed: "嵌入完整字体而不是子集，通常不建议开启。",
+  fallback_full_font_embed: "子集化失败时自动改用完整字体嵌入。",
   variable_fonts: "可变字体支持，当前默认关闭。",
 };
 
@@ -65,6 +68,7 @@ const statusLabels: Record<string, string> = {
   success: "完成",
   partial: "部分完成",
   failed: "失败",
+  cancelled: "已取消",
 };
 
 const modeLabels: Record<string, string> = {
@@ -94,6 +98,8 @@ export default function App() {
   const loggedIn = !authRequired || Boolean(csrf);
   const recentFile = files[0];
   const jobCounts = status?.jobs ?? {};
+  const controls = status?.config.controls;
+  const conversionParallelism = controls?.conversion_parallelism ?? status?.config.max_concurrent_jobs ?? 1;
 
   useEffect(() => {
     if (status?.config.scan_interval_seconds !== undefined) {
@@ -264,6 +270,24 @@ export default function App() {
     }
   }
 
+  async function setParallelism(value: number) {
+    const next = Math.max(1, Math.min(32, Math.round(value)));
+    setBusy("parallelism");
+    setError("");
+    try {
+      await apiRequest("/api/conversion/parallelism", {
+        method: "POST",
+        csrf,
+        body: { value: next },
+      });
+      await loadAll("refresh");
+    } catch (err) {
+      setError(readError(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
   function submitSchedule(event: FormEvent) {
     event.preventDefault();
     const minutes = Number(scheduleMinutes);
@@ -357,6 +381,15 @@ export default function App() {
               <span>扫描已配置的容器内目录，未处理字幕会自动入队。</span>
             </div>
             <IconButton label="扫描目录" title="立即扫描所有监听目录。" icon={<Play size={16} />} busy={busy === "scan"} onClick={() => void runAction("scan", "/api/scan")} disabled={!loggedIn} />
+            <IconButton
+              label={controls?.scan_paused ? "继续扫描" : "暂停扫描"}
+              title={controls?.scan_paused ? "继续当前扫描步骤。" : "暂停正在进行的扫描步骤。"}
+              icon={controls?.scan_paused ? <Play size={16} /> : <Pause size={16} />}
+              busy={busy === "scan-control"}
+              onClick={() => void runAction("scan-control", controls?.scan_paused ? "/api/scan/resume" : "/api/scan/pause")}
+              disabled={!loggedIn}
+            />
+            <IconButton label="取消扫描" title="取消当前扫描步骤。" icon={<X size={16} />} busy={busy === "scan-cancel"} onClick={() => void runAction("scan-cancel", "/api/scan/cancel")} disabled={!loggedIn} danger />
           </div>
           <form className="schedule-card" onSubmit={submitSchedule}>
             <div>
@@ -436,14 +469,37 @@ export default function App() {
             <Metric label="完成" value={(jobCounts.success ?? 0) + (jobCounts.partial ?? 0)} />
             <Metric label="失败" value={jobCounts.failed ?? 0} tone={jobCounts.failed ? "bad" : "ok"} />
           </div>
+          <div className="action-strip">
+            <IconButton
+              label={controls?.conversion_paused ? "继续转换" : "暂停转换"}
+              title={controls?.conversion_paused ? "继续启动排队中的转换任务。" : "暂停启动新的转换任务。"}
+              icon={controls?.conversion_paused ? <Play size={16} /> : <Pause size={16} />}
+              busy={busy === "conversion-control"}
+              onClick={() => void runAction("conversion-control", controls?.conversion_paused ? "/api/conversion/resume" : "/api/conversion/pause")}
+              disabled={!loggedIn}
+            />
+            <IconButton label="取消队列" title="取消尚未开始的转换任务。" icon={<X size={16} />} busy={busy === "conversion-cancel"} onClick={() => void runAction("conversion-cancel", "/api/conversion/cancel")} disabled={!loggedIn} danger />
+            <div className="stepper-field">
+              <span className="stepper-label">并行</span>
+              <div className="stepper" data-tooltip="调整同时运行的转换任务数。">
+                <button type="button" onClick={() => void setParallelism(conversionParallelism - 1)} disabled={!loggedIn || busy === "parallelism" || conversionParallelism <= 1}>-</button>
+                <span>{conversionParallelism}</span>
+                <button type="button" onClick={() => void setParallelism(conversionParallelism + 1)} disabled={!loggedIn || busy === "parallelism" || conversionParallelism >= 32}>+</button>
+              </div>
+            </div>
+          </div>
           <div className="table-tools">
             <Filter size={16} />
             <select value={jobFilter} onChange={(event) => setJobFilter(event.target.value)}>
               <option value="all">全部作业</option>
               <option value="subset">转换</option>
               <option value="strip_embedded">清理还原</option>
+              <option value="queued">排队</option>
+              <option value="running">运行中</option>
+              <option value="success">已完成</option>
               <option value="failed">失败</option>
               <option value="partial">部分完成</option>
+              <option value="cancelled">已取消</option>
             </select>
           </div>
           <JobTable jobs={filteredJobs} busy={busy} onRetry={(job) => void runAction(`retry-${job.id}`, `/api/jobs/${job.id}/retry`)} />
@@ -655,6 +711,7 @@ function JobTable({ jobs, busy, onRetry }: { jobs: Job[]; busy: string | null; o
                 <span className="job-id">#{job.id}</span>
                 <code>{job.path}</code>
                 {Array.isArray(job.missing_fonts) && job.missing_fonts.length ? <small>{job.missing_fonts.join(", ")}</small> : null}
+                {job.status === "failed" && job.message ? <small className="error-text">{job.message}</small> : null}
               </td>
               <td>{modeLabels[job.mode ?? "subset"] ?? job.mode}</td>
               <td><StatusBadge status={job.status} /></td>

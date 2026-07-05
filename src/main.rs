@@ -48,7 +48,8 @@ async fn main() -> anyhow::Result<()> {
     let state = Arc::new(AppState::new(config.clone(), db, events, workers, job_tx));
     state.load_runtime_settings().await?;
 
-    processor::spawn_job_loop(job_rx, state.clone());
+    processor::spawn_controlled_job_loop(job_rx, state.clone());
+    processor::recover_incomplete_jobs(state.clone()).await?;
     indexer::spawn_initial_index(state.clone());
     scanner::spawn_scheduler(state.clone());
 

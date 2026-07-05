@@ -27,7 +27,15 @@ export type StatusResponse = {
     data_dir?: string;
     scan_interval_seconds?: number;
     backup_retention_days?: number;
+    max_concurrent_jobs?: number;
     max_index_concurrency?: number;
+    controls?: {
+      scan_paused?: boolean;
+      scan_cancel_requested?: boolean;
+      conversion_paused?: boolean;
+      conversion_cancel_requested?: boolean;
+      conversion_parallelism?: number;
+    };
     options?: Record<string, boolean | undefined>;
   };
 };

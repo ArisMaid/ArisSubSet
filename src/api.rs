@@ -38,9 +38,19 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/status", get(status))
         .route("/api/index/rebuild", post(rebuild_index))
         .route("/api/scan", post(scan))
+        .route("/api/scan/pause", post(pause_scan))
+        .route("/api/scan/resume", post(resume_scan))
+        .route("/api/scan/cancel", post(cancel_scan))
         .route("/api/watch-dirs", post(add_watch_dir))
         .route("/api/watch-dirs/remove", post(remove_watch_dir))
         .route("/api/options", post(set_option))
+        .route("/api/conversion/pause", post(pause_conversion))
+        .route("/api/conversion/resume", post(resume_conversion))
+        .route("/api/conversion/cancel", post(cancel_conversion))
+        .route(
+            "/api/conversion/parallelism",
+            post(set_conversion_parallelism),
+        )
         .route("/api/schedule", post(set_schedule))
         .route("/api/upload", post(upload_subtitle))
         .route("/api/files", get(files))
@@ -151,6 +161,7 @@ async fn status(State(state): State<Arc<AppState>>) -> Result<Json<StatusRespons
         .collect();
     let options = state.processing_options().await;
     let scan_interval = state.scan_interval().await;
+    let controls = state.controls().await;
 
     Ok(Json(StatusResponse {
         fonts: serde_json::json!({
@@ -172,7 +183,9 @@ async fn status(State(state): State<Arc<AppState>>) -> Result<Json<StatusRespons
             "data_dir": state.config.data_dir,
             "scan_interval_seconds": scan_interval.as_secs(),
             "backup_retention_days": state.config.backup_retention_days,
+            "max_concurrent_jobs": state.config.max_concurrent_jobs,
             "max_index_concurrency": state.config.max_index_concurrency,
+            "controls": controls,
             "options": options,
         }),
         capabilities: serde_json::json!({
@@ -231,6 +244,36 @@ async fn scan(
             Err(err) => st.events.emit("scan", "err", format!("扫描失败：{err:#}")),
         }
     });
+    Ok(Json(serde_json::json!({"ok": true})))
+}
+
+async fn pause_scan(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    auth::require_auth(&state, &headers, true).await?;
+    state.set_scan_paused(true).await;
+    state.events.emit("scan", "info", "scan paused");
+    Ok(Json(serde_json::json!({"ok": true})))
+}
+
+async fn resume_scan(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    auth::require_auth(&state, &headers, true).await?;
+    state.set_scan_paused(false).await;
+    state.events.emit("scan", "info", "scan resumed");
+    Ok(Json(serde_json::json!({"ok": true})))
+}
+
+async fn cancel_scan(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    auth::require_auth(&state, &headers, true).await?;
+    state.request_scan_cancel().await;
+    state.events.emit("scan", "warn", "scan cancel requested");
     Ok(Json(serde_json::json!({"ok": true})))
 }
 
@@ -306,6 +349,68 @@ async fn set_option(
         ),
     );
     Ok(Json(serde_json::json!({"ok": true, "options": options})))
+}
+
+async fn pause_conversion(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    auth::require_auth(&state, &headers, true).await?;
+    state.set_conversion_paused(true).await;
+    state.events.emit("job", "info", "conversion queue paused");
+    Ok(Json(serde_json::json!({"ok": true})))
+}
+
+async fn resume_conversion(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    auth::require_auth(&state, &headers, true).await?;
+    state.set_conversion_paused(false).await;
+    state.events.emit("job", "info", "conversion queue resumed");
+    Ok(Json(serde_json::json!({"ok": true})))
+}
+
+async fn cancel_conversion(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    auth::require_auth(&state, &headers, true).await?;
+    state.request_conversion_cancel().await;
+    let cancelled = processor::cancel_queued_jobs(&state)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    state.events.emit(
+        "job",
+        "warn",
+        format!("conversion cancel requested, queued jobs cancelled: {cancelled}"),
+    );
+    Ok(Json(
+        serde_json::json!({"ok": true, "cancelled": cancelled}),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct ParallelismRequest {
+    value: usize,
+}
+
+async fn set_conversion_parallelism(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<ParallelismRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    auth::require_auth(&state, &headers, true).await?;
+    let value = state
+        .set_conversion_parallelism(req.value)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    state.events.emit(
+        "config",
+        "ok",
+        format!("conversion parallelism set to {value}"),
+    );
+    Ok(Json(serde_json::json!({"ok": true, "value": value})))
 }
 
 #[derive(Debug, Deserialize)]
@@ -406,7 +511,7 @@ async fn jobs(
 SELECT id, subtitle_id, path, mode, status, queued_at, started_at, finished_at, message, missing_fonts, stats
 FROM jobs
 ORDER BY id DESC
-LIMIT 200
+LIMIT 1000
 "#,
     )
     .fetch_all(&state.db.pool)
@@ -613,6 +718,7 @@ fn option_label(key: &str) -> &str {
         "randomize_font_names" => "随机字体名",
         "draw_subset" => "绘图字体",
         "full_font_embed" => "完整嵌入",
+        "fallback_full_font_embed" => "失败回退完整嵌入",
         "variable_fonts" => "可变字体",
         _ => "处理选项",
     }

@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -8,6 +9,7 @@ use sqlx::Row;
 use tokio::io::AsyncReadExt;
 use walkdir::WalkDir;
 
+use crate::ass::{decode_subtitle, parse_font_subset_comments};
 use crate::config::root_label;
 use crate::models::JobMode;
 use crate::state::AppState;
@@ -52,7 +54,366 @@ pub struct ScanSummary {
     pub failed: usize,
 }
 
+#[derive(Debug, Clone)]
+struct SubtitleCandidate {
+    path: PathBuf,
+    path_s: String,
+    root_label: String,
+    relative_path: String,
+    size: i64,
+    mtime: i64,
+}
+
+#[derive(Debug, Clone)]
+struct ExistingSubtitle {
+    id: i64,
+    size: i64,
+    mtime: i64,
+    sha256: String,
+    last_config_hash: Option<String>,
+    last_status: Option<String>,
+}
+
+#[derive(Debug)]
+struct QueueCandidate {
+    meta: SubtitleCandidate,
+    sha256: String,
+}
+
 pub async fn scan_now(state: Arc<AppState>) -> anyhow::Result<ScanSummary> {
+    state.clear_scan_cancel().await;
+    let mut summary = ScanSummary::default();
+    let config_hash = state.config_hash().await;
+    let roots = effective_watch_dirs(&state).await?;
+    let mut candidates = Vec::new();
+    for (idx, root) in roots.iter().enumerate() {
+        if !state.wait_for_scan_turn().await {
+            state.events.emit("scan", "warn", "scan cancelled");
+            return Ok(summary);
+        }
+        if !root.exists() {
+            state.events.emit(
+                "scan",
+                "warn",
+                format!("监听目录不存在：{}", root.display()),
+            );
+            continue;
+        }
+        let label = root_label(root, idx);
+        for entry in WalkDir::new(root)
+            .follow_links(true)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
+            if !state.wait_for_scan_turn().await {
+                state.events.emit("scan", "warn", "scan cancelled");
+                return Ok(summary);
+            }
+            if !entry.file_type().is_file() || !is_subtitle_path(entry.path()) {
+                continue;
+            }
+            summary.seen += 1;
+            match subtitle_candidate(root, &label, entry.path()).await {
+                Ok(candidate) => candidates.push(candidate),
+                Err(err) => {
+                    summary.failed += 1;
+                    state.events.emit(
+                        "scan",
+                        "warn",
+                        format!("scan metadata failed: {}: {err:#}", entry.path().display()),
+                    );
+                }
+            }
+        }
+    }
+
+    let existing = load_existing_subtitles(&state).await?;
+    let active = load_active_subtitle_ids(&state).await?;
+    let mut queue_candidates = Vec::new();
+    for candidate in candidates {
+        if !state.wait_for_scan_turn().await {
+            state.events.emit("scan", "warn", "scan cancelled");
+            return Ok(summary);
+        }
+        match filter_candidate(&state, &candidate, &existing, &active, &config_hash).await {
+            Ok(Some(queue_candidate)) => queue_candidates.push(queue_candidate),
+            Ok(None) => summary.skipped += 1,
+            Err(err) => {
+                summary.failed += 1;
+                state.events.emit(
+                    "scan",
+                    "warn",
+                    format!("scan inspect failed: {}: {err:#}", candidate.path.display()),
+                );
+            }
+        }
+    }
+
+    for candidate in queue_candidates {
+        if !state.wait_for_scan_turn().await {
+            state.events.emit("scan", "warn", "scan cancelled");
+            return Ok(summary);
+        }
+        match enqueue_candidate(&state, candidate).await {
+            Ok(EnqueueResult::Queued) => summary.queued += 1,
+            Ok(EnqueueResult::Skipped) => summary.skipped += 1,
+            Err(err) => {
+                summary.failed += 1;
+                state
+                    .events
+                    .emit("scan", "warn", format!("enqueue failed: {err:#}"));
+            }
+        }
+    }
+    state.clear_scan_cancel().await;
+    Ok(summary)
+}
+
+async fn subtitle_candidate(
+    root: &Path,
+    root_label: &str,
+    path: &Path,
+) -> anyhow::Result<SubtitleCandidate> {
+    let meta = tokio::fs::metadata(path).await?;
+    let size = meta.len() as i64;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let path_s = path.to_string_lossy().to_string();
+    let relative_path = path
+        .strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    Ok(SubtitleCandidate {
+        path: path.to_path_buf(),
+        path_s,
+        root_label: root_label.to_string(),
+        relative_path,
+        size,
+        mtime,
+    })
+}
+
+async fn load_existing_subtitles(
+    state: &Arc<AppState>,
+) -> anyhow::Result<HashMap<String, ExistingSubtitle>> {
+    let rows = sqlx::query(
+        "SELECT id, path, size, mtime, sha256, last_config_hash, last_status FROM subtitle_files",
+    )
+    .fetch_all(&state.db.pool)
+    .await?;
+    let mut out = HashMap::with_capacity(rows.len());
+    for row in rows {
+        let path: String = row.get("path");
+        out.insert(
+            path,
+            ExistingSubtitle {
+                id: row.get("id"),
+                size: row.get("size"),
+                mtime: row.get("mtime"),
+                sha256: row.get("sha256"),
+                last_config_hash: row.get("last_config_hash"),
+                last_status: row.get("last_status"),
+            },
+        );
+    }
+    Ok(out)
+}
+
+async fn load_active_subtitle_ids(state: &Arc<AppState>) -> anyhow::Result<HashSet<i64>> {
+    let rows =
+        sqlx::query("SELECT DISTINCT subtitle_id FROM jobs WHERE status IN ('queued', 'running')")
+            .fetch_all(&state.db.pool)
+            .await?;
+    Ok(rows.into_iter().map(|row| row.get("subtitle_id")).collect())
+}
+
+async fn filter_candidate(
+    state: &Arc<AppState>,
+    candidate: &SubtitleCandidate,
+    existing: &HashMap<String, ExistingSubtitle>,
+    active: &HashSet<i64>,
+    config_hash: &str,
+) -> anyhow::Result<Option<QueueCandidate>> {
+    if let Some(old) = existing.get(&candidate.path_s) {
+        if active.contains(&old.id) {
+            return Ok(None);
+        }
+        if old.size == candidate.size
+            && old.mtime == candidate.mtime
+            && old.last_config_hash.as_deref() == Some(config_hash)
+            && matches!(old.last_status.as_deref(), Some("success" | "partial"))
+        {
+            return Ok(None);
+        }
+    }
+
+    let sha256 = full_hash(&candidate.path).await?;
+    if let Some(old) = existing.get(&candidate.path_s)
+        && old.sha256 == sha256
+        && old.last_config_hash.as_deref() == Some(config_hash)
+        && matches!(old.last_status.as_deref(), Some("success" | "partial"))
+    {
+        sync_subtitle_meta(state, candidate, &sha256).await?;
+        return Ok(None);
+    }
+    if detect_already_subsetted(&candidate.path).await? {
+        mark_already_subsetted(state, candidate, &sha256, config_hash).await?;
+        state.events.emit(
+            "scan",
+            "info",
+            format!("already subsetted, skipped: {}", candidate.path.display()),
+        );
+        return Ok(None);
+    }
+    Ok(Some(QueueCandidate {
+        meta: candidate.clone(),
+        sha256,
+    }))
+}
+
+async fn sync_subtitle_meta(
+    state: &Arc<AppState>,
+    candidate: &SubtitleCandidate,
+    sha256: &str,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+UPDATE subtitle_files
+SET root_label=?, relative_path=?, size=?, mtime=?, sha256=?
+WHERE path=?
+"#,
+    )
+    .bind(&candidate.root_label)
+    .bind(&candidate.relative_path)
+    .bind(candidate.size)
+    .bind(candidate.mtime)
+    .bind(sha256)
+    .bind(&candidate.path_s)
+    .execute(&state.db.pool)
+    .await?;
+    Ok(())
+}
+
+async fn mark_already_subsetted(
+    state: &Arc<AppState>,
+    candidate: &SubtitleCandidate,
+    sha256: &str,
+    config_hash: &str,
+) -> anyhow::Result<()> {
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        r#"
+INSERT INTO subtitle_files(path, root_label, relative_path, size, mtime, sha256, last_config_hash, last_status, last_processed_at, missing_fonts, error)
+VALUES(?, ?, ?, ?, ?, ?, ?, 'success', ?, '[]', NULL)
+ON CONFLICT(path) DO UPDATE SET
+  root_label=excluded.root_label,
+  relative_path=excluded.relative_path,
+  size=excluded.size,
+  mtime=excluded.mtime,
+  sha256=excluded.sha256,
+  last_config_hash=excluded.last_config_hash,
+  last_status=excluded.last_status,
+  last_processed_at=excluded.last_processed_at,
+  missing_fonts=excluded.missing_fonts,
+  error=NULL
+"#,
+    )
+    .bind(&candidate.path_s)
+    .bind(&candidate.root_label)
+    .bind(&candidate.relative_path)
+    .bind(candidate.size)
+    .bind(candidate.mtime)
+    .bind(sha256)
+    .bind(config_hash)
+    .bind(now)
+    .execute(&state.db.pool)
+    .await?;
+    Ok(())
+}
+
+async fn detect_already_subsetted(path: &Path) -> anyhow::Result<bool> {
+    let bytes = tokio::fs::read(path).await?;
+    let Ok(decoded) = decode_subtitle(&bytes) else {
+        return Ok(false);
+    };
+    if !parse_font_subset_comments(&decoded.text).is_empty() {
+        return Ok(true);
+    }
+    Ok(decoded.text.to_ascii_lowercase().contains("assdrawsubset"))
+}
+
+async fn enqueue_candidate(
+    state: &Arc<AppState>,
+    candidate: QueueCandidate,
+) -> anyhow::Result<EnqueueResult> {
+    let meta = candidate.meta;
+    if let Some(row) = sqlx::query("SELECT id FROM subtitle_files WHERE path = ?")
+        .bind(&meta.path_s)
+        .fetch_optional(&state.db.pool)
+        .await?
+    {
+        let subtitle_id: i64 = row.get("id");
+        if has_active_job(state, subtitle_id).await? {
+            return Ok(EnqueueResult::Skipped);
+        }
+    }
+
+    sqlx::query(
+        r#"
+INSERT INTO subtitle_files(path, root_label, relative_path, size, mtime, sha256)
+VALUES(?, ?, ?, ?, ?, ?)
+ON CONFLICT(path) DO UPDATE SET
+  root_label=excluded.root_label,
+  relative_path=excluded.relative_path,
+  size=excluded.size,
+  mtime=excluded.mtime,
+  sha256=excluded.sha256
+"#,
+    )
+    .bind(&meta.path_s)
+    .bind(&meta.root_label)
+    .bind(&meta.relative_path)
+    .bind(meta.size)
+    .bind(meta.mtime)
+    .bind(&candidate.sha256)
+    .execute(&state.db.pool)
+    .await?;
+    let subtitle_id: i64 = sqlx::query_scalar("SELECT id FROM subtitle_files WHERE path = ?")
+        .bind(&meta.path_s)
+        .fetch_one(&state.db.pool)
+        .await?;
+    if has_active_job(state, subtitle_id).await? {
+        return Ok(EnqueueResult::Skipped);
+    }
+    let now = Utc::now().to_rfc3339();
+    let job_id = sqlx::query(
+        "INSERT INTO jobs(subtitle_id, path, mode, status, queued_at) VALUES(?, ?, ?, 'queued', ?)",
+    )
+    .bind(subtitle_id)
+    .bind(&meta.path_s)
+    .bind(JobMode::Subset.as_str())
+    .bind(now)
+    .execute(&state.db.pool)
+    .await?
+    .last_insert_rowid();
+    state
+        .job_tx
+        .send(job_id)
+        .await
+        .context("job queue closed")?;
+    state
+        .events
+        .emit("scan", "info", format!("queued: {}", meta.path.display()));
+    Ok(EnqueueResult::Queued)
+}
+
+#[allow(dead_code)]
+pub async fn scan_now_legacy(state: Arc<AppState>) -> anyhow::Result<ScanSummary> {
     let mut summary = ScanSummary::default();
     let config_hash = state.config_hash().await;
     let roots = effective_watch_dirs(&state).await?;
@@ -61,7 +422,7 @@ pub async fn scan_now(state: Arc<AppState>) -> anyhow::Result<ScanSummary> {
             state.events.emit(
                 "scan",
                 "warn",
-                format!("监听目录不存在：{}", root.display()),
+                format!("鐩戝惉鐩綍涓嶅瓨鍦細{}", root.display()),
             );
             continue;
         }

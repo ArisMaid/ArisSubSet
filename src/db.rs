@@ -100,6 +100,8 @@ CREATE TABLE IF NOT EXISTS font_names (
         .await?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_font_names_norm ON font_names(normalized);")
             .await?;
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_font_names_face ON font_names(face_id);")
+            .await?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_font_faces_file ON font_faces(file_id);")
             .await?;
         conn.execute(
