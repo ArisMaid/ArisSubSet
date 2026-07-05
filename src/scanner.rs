@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use chrono::Utc;
@@ -9,10 +10,13 @@ use sqlx::Row;
 use tokio::io::AsyncReadExt;
 use walkdir::WalkDir;
 
-use crate::ass::{decode_subtitle, parse_font_subset_comments};
+use crate::ass::parse_font_subset_comments;
 use crate::config::root_label;
 use crate::models::JobMode;
 use crate::state::AppState;
+
+const SCAN_PROGRESS_INTERVAL: Duration = Duration::from_secs(10);
+const SCAN_PROGRESS_CANDIDATES: usize = 50;
 
 pub fn spawn_scheduler(state: Arc<AppState>) {
     tokio::spawn(async move {
@@ -85,7 +89,9 @@ pub async fn scan_now(state: Arc<AppState>) -> anyhow::Result<ScanSummary> {
     let mut summary = ScanSummary::default();
     let config_hash = state.config_hash().await;
     let roots = effective_watch_dirs(&state).await?;
+    let mut last_progress = Instant::now();
     let mut candidates = Vec::new();
+
     for (idx, root) in roots.iter().enumerate() {
         if !state.wait_for_scan_turn().await {
             state.events.emit("scan", "warn", "scan cancelled");
@@ -100,21 +106,36 @@ pub async fn scan_now(state: Arc<AppState>) -> anyhow::Result<ScanSummary> {
             continue;
         }
         let label = root_label(root, idx);
+        state.events.emit(
+            "scan",
+            "info",
+            format!("scanning root {}: {}", idx + 1, root.display()),
+        );
         for entry in WalkDir::new(root)
-            .follow_links(true)
+            .follow_links(false)
             .into_iter()
-            .filter_map(Result::ok)
+            .filter_entry(should_visit_scan_entry)
         {
             if !state.wait_for_scan_turn().await {
                 state.events.emit("scan", "warn", "scan cancelled");
                 return Ok(summary);
             }
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    summary.failed += 1;
+                    state
+                        .events
+                        .emit("scan", "warn", format!("scan walk failed: {err:#}"));
+                    continue;
+                }
+            };
             if !entry.file_type().is_file() || !is_subtitle_path(entry.path()) {
                 continue;
             }
             summary.seen += 1;
-            match subtitle_candidate(root, &label, entry.path()).await {
-                Ok(candidate) => candidates.push(candidate),
+            let candidate = match subtitle_candidate(root, &label, entry.path()).await {
+                Ok(candidate) => candidate,
                 Err(err) => {
                     summary.failed += 1;
                     state.events.emit(
@@ -122,15 +143,38 @@ pub async fn scan_now(state: Arc<AppState>) -> anyhow::Result<ScanSummary> {
                         "warn",
                         format!("scan metadata failed: {}: {err:#}", entry.path().display()),
                     );
+                    emit_scan_progress(
+                        &state,
+                        "scan discover progress",
+                        &summary,
+                        &mut last_progress,
+                        false,
+                    );
+                    continue;
                 }
-            }
+            };
+            candidates.push(candidate);
+            emit_scan_progress(
+                &state,
+                "scan discover progress",
+                &summary,
+                &mut last_progress,
+                false,
+            );
         }
+        emit_scan_progress(
+            &state,
+            "scan discover progress",
+            &summary,
+            &mut last_progress,
+            true,
+        );
     }
 
     let existing = load_existing_subtitles(&state).await?;
     let active = load_active_subtitle_ids(&state).await?;
     let mut queue_candidates = Vec::new();
-    for candidate in candidates {
+    for (idx, candidate) in candidates.into_iter().enumerate() {
         if !state.wait_for_scan_turn().await {
             state.events.emit("scan", "warn", "scan cancelled");
             return Ok(summary);
@@ -147,9 +191,32 @@ pub async fn scan_now(state: Arc<AppState>) -> anyhow::Result<ScanSummary> {
                 );
             }
         }
+        emit_scan_stage_progress(
+            &state,
+            "scan filter progress",
+            idx + 1,
+            summary.seen,
+            queue_candidates.len(),
+            summary.skipped,
+            summary.failed,
+            &mut last_progress,
+            false,
+        );
     }
+    emit_scan_stage_progress(
+        &state,
+        "scan filter progress",
+        summary.seen,
+        summary.seen,
+        queue_candidates.len(),
+        summary.skipped,
+        summary.failed,
+        &mut last_progress,
+        true,
+    );
 
-    for candidate in queue_candidates {
+    let ready = queue_candidates.len();
+    for (idx, candidate) in queue_candidates.into_iter().enumerate() {
         if !state.wait_for_scan_turn().await {
             state.events.emit("scan", "warn", "scan cancelled");
             return Ok(summary);
@@ -164,9 +231,100 @@ pub async fn scan_now(state: Arc<AppState>) -> anyhow::Result<ScanSummary> {
                     .emit("scan", "warn", format!("enqueue failed: {err:#}"));
             }
         }
+        emit_scan_stage_progress(
+            &state,
+            "scan enqueue progress",
+            idx + 1,
+            ready,
+            summary.queued,
+            summary.skipped,
+            summary.failed,
+            &mut last_progress,
+            false,
+        );
     }
+    emit_scan_stage_progress(
+        &state,
+        "scan enqueue progress",
+        ready,
+        ready,
+        summary.queued,
+        summary.skipped,
+        summary.failed,
+        &mut last_progress,
+        true,
+    );
+
     state.clear_scan_cancel().await;
     Ok(summary)
+}
+
+fn should_visit_scan_entry(entry: &walkdir::DirEntry) -> bool {
+    if entry.depth() == 0 || !entry.file_type().is_dir() {
+        return true;
+    }
+    !is_ignored_scan_dir(entry.file_name().to_string_lossy().as_ref())
+}
+
+fn is_ignored_scan_dir(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        ".sync"
+            | "@eadir"
+            | "#recycle"
+            | "$recycle.bin"
+            | "system volume information"
+            | "incomplete"
+            | "speedtest"
+    )
+}
+
+fn emit_scan_progress(
+    state: &Arc<AppState>,
+    label: &str,
+    summary: &ScanSummary,
+    last_progress: &mut Instant,
+    force: bool,
+) {
+    let candidate_tick = summary.seen > 0 && summary.seen % SCAN_PROGRESS_CANDIDATES == 0;
+    if !force && !candidate_tick && last_progress.elapsed() < SCAN_PROGRESS_INTERVAL {
+        return;
+    }
+    *last_progress = Instant::now();
+    state.events.emit(
+        "scan",
+        "info",
+        format!(
+            "{label}: seen {}, queued {}, skipped {}, failed {}",
+            summary.seen, summary.queued, summary.skipped, summary.failed
+        ),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_scan_stage_progress(
+    state: &Arc<AppState>,
+    label: &str,
+    done: usize,
+    total: usize,
+    ready_or_queued: usize,
+    skipped: usize,
+    failed: usize,
+    last_progress: &mut Instant,
+    force: bool,
+) {
+    let candidate_tick = done > 0 && done % SCAN_PROGRESS_CANDIDATES == 0;
+    if !force && !candidate_tick && last_progress.elapsed() < SCAN_PROGRESS_INTERVAL {
+        return;
+    }
+    *last_progress = Instant::now();
+    state.events.emit(
+        "scan",
+        "info",
+        format!(
+            "{label}: {done}/{total}, ready_or_queued {ready_or_queued}, skipped {skipped}, failed {failed}"
+        ),
+    );
 }
 
 async fn subtitle_candidate(
@@ -252,6 +410,12 @@ async fn filter_candidate(
         }
     }
 
+    if detect_already_subsetted(&candidate.path).await? {
+        let fingerprint = metadata_fingerprint(candidate);
+        mark_already_subsetted(state, candidate, &fingerprint, config_hash).await?;
+        return Ok(None);
+    }
+
     let sha256 = full_hash(&candidate.path).await?;
     if let Some(old) = existing.get(&candidate.path_s)
         && old.sha256 == sha256
@@ -259,15 +423,6 @@ async fn filter_candidate(
         && matches!(old.last_status.as_deref(), Some("success" | "partial"))
     {
         sync_subtitle_meta(state, candidate, &sha256).await?;
-        return Ok(None);
-    }
-    if detect_already_subsetted(&candidate.path).await? {
-        mark_already_subsetted(state, candidate, &sha256, config_hash).await?;
-        state.events.emit(
-            "scan",
-            "info",
-            format!("already subsetted, skipped: {}", candidate.path.display()),
-        );
         return Ok(None);
     }
     Ok(Some(QueueCandidate {
@@ -336,15 +491,41 @@ ON CONFLICT(path) DO UPDATE SET
     Ok(())
 }
 
+fn metadata_fingerprint(candidate: &SubtitleCandidate) -> String {
+    format!("metadata:{}:{}", candidate.size, candidate.mtime)
+}
+
 async fn detect_already_subsetted(path: &Path) -> anyhow::Result<bool> {
-    let bytes = tokio::fs::read(path).await?;
-    let Ok(decoded) = decode_subtitle(&bytes) else {
-        return Ok(false);
-    };
-    if !parse_font_subset_comments(&decoded.text).is_empty() {
+    let mut f = tokio::fs::File::open(path).await?;
+    let mut bytes = vec![0u8; 1024 * 1024];
+    let n = f.read(&mut bytes).await?;
+    bytes.truncate(n);
+    let text = decode_prefix_lossy(&bytes);
+    if !parse_font_subset_comments(&text).is_empty() {
         return Ok(true);
     }
-    Ok(decoded.text.to_ascii_lowercase().contains("assdrawsubset"))
+    Ok(text.to_ascii_lowercase().contains("assdrawsubset"))
+}
+
+fn decode_prefix_lossy(bytes: &[u8]) -> String {
+    if bytes.starts_with(&[0xFF, 0xFE]) {
+        let body = &bytes[2..bytes.len() - (bytes.len() % 2)];
+        let words: Vec<u16> = body
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect();
+        return String::from_utf16_lossy(&words);
+    }
+    if bytes.starts_with(&[0xFE, 0xFF]) {
+        let body = &bytes[2..bytes.len() - (bytes.len() % 2)];
+        let words: Vec<u16> = body
+            .chunks_exact(2)
+            .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
+            .collect();
+        return String::from_utf16_lossy(&words);
+    }
+    let body = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    String::from_utf8_lossy(body).into_owned()
 }
 
 async fn enqueue_candidate(
