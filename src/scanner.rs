@@ -3,10 +3,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::sqlx::{Row, Sqlite, Transaction};
 use anyhow::{Context, anyhow};
 use chrono::Utc;
 use sha2::{Digest, Sha256};
-use sqlx::{Row, Sqlite, Transaction};
 use tokio::io::AsyncReadExt;
 use tokio::task::JoinSet;
 
@@ -459,7 +459,7 @@ fn subtitle_candidate(root: &Path, root_label: &str, file: DiscoveredFile) -> Su
 async fn load_existing_subtitles(
     state: &Arc<AppState>,
 ) -> anyhow::Result<HashMap<String, ExistingSubtitle>> {
-    let rows = sqlx::query(
+    let rows = crate::sqlx::query(
         "SELECT id, path, size, mtime, sha256, last_config_hash, last_status, last_font_index_revision FROM subtitle_files",
     )
     .fetch_all(&state.db.pool)
@@ -484,10 +484,11 @@ async fn load_existing_subtitles(
 }
 
 async fn load_active_subtitle_ids(state: &Arc<AppState>) -> anyhow::Result<HashSet<i64>> {
-    let rows =
-        sqlx::query("SELECT DISTINCT subtitle_id FROM jobs WHERE status IN ('queued', 'running')")
-            .fetch_all(&state.db.pool)
-            .await?;
+    let rows = crate::sqlx::query(
+        "SELECT DISTINCT subtitle_id FROM jobs WHERE status IN ('queued', 'running')",
+    )
+    .fetch_all(&state.db.pool)
+    .await?;
     Ok(rows.into_iter().map(|row| row.get("subtitle_id")).collect())
 }
 
@@ -552,7 +553,7 @@ async fn sync_subtitle_meta(
     candidate: &SubtitleCandidate,
     sha256: &str,
 ) -> anyhow::Result<()> {
-    sqlx::query(
+    crate::sqlx::query(
         r#"
 UPDATE subtitle_files
 SET root_label=?, relative_path=?, size=?, mtime=?, sha256=?
@@ -578,7 +579,7 @@ async fn mark_already_subsetted(
     font_index_revision: u64,
 ) -> anyhow::Result<()> {
     let now = Utc::now().to_rfc3339();
-    sqlx::query(
+    crate::sqlx::query(
         r#"
 INSERT INTO subtitle_files(path, root_label, relative_path, size, mtime, sha256, last_config_hash, last_status, last_processed_at, missing_fonts, error, last_font_index_revision)
 VALUES(?, ?, ?, ?, ?, ?, ?, 'success', ?, '[]', NULL, ?)
@@ -724,7 +725,7 @@ async fn enqueue_candidate_tx(
     queued_at: &str,
 ) -> anyhow::Result<Option<i64>> {
     let meta = &candidate.meta;
-    let subtitle_id: i64 = sqlx::query_scalar(
+    let subtitle_id: i64 = crate::sqlx::query_scalar(
         r#"
 INSERT INTO subtitle_files(path, root_label, relative_path, size, mtime, sha256)
 VALUES(?, ?, ?, ?, ?, ?)
@@ -745,7 +746,7 @@ RETURNING id
     .bind(&candidate.sha256)
     .fetch_one(&mut **tx)
     .await?;
-    let job_id = sqlx::query_scalar(
+    let job_id = crate::sqlx::query_scalar(
         r#"
 INSERT INTO jobs(subtitle_id, path, mode, status, queued_at)
 SELECT ?, ?, ?, 'queued', ?
@@ -780,7 +781,7 @@ pub struct WatchDirEntry {
 }
 
 pub async fn watch_dir_entries(state: &Arc<AppState>) -> anyhow::Result<Vec<WatchDirEntry>> {
-    let rows = sqlx::query("SELECT path FROM watch_dirs ORDER BY id ASC")
+    let rows = crate::sqlx::query("SELECT path FROM watch_dirs ORDER BY id ASC")
         .fetch_all(&state.db.pool)
         .await?;
     let mut dirs: Vec<WatchDirEntry> = state
@@ -808,7 +809,7 @@ pub async fn watch_dir_entries(state: &Arc<AppState>) -> anyhow::Result<Vec<Watc
 
 pub async fn add_watch_dir(state: &Arc<AppState>, path: &Path) -> anyhow::Result<()> {
     let now = Utc::now().to_rfc3339();
-    sqlx::query(
+    crate::sqlx::query(
         "INSERT INTO watch_dirs(path, created_at) VALUES(?, ?) ON CONFLICT(path) DO NOTHING",
     )
     .bind(path.to_string_lossy().to_string())
@@ -819,7 +820,7 @@ pub async fn add_watch_dir(state: &Arc<AppState>, path: &Path) -> anyhow::Result
 }
 
 pub async fn remove_watch_dir(state: &Arc<AppState>, path: &Path) -> anyhow::Result<bool> {
-    let result = sqlx::query("DELETE FROM watch_dirs WHERE path = ?")
+    let result = crate::sqlx::query("DELETE FROM watch_dirs WHERE path = ?")
         .bind(path.to_string_lossy().to_string())
         .execute(&state.db.pool)
         .await?;
@@ -841,7 +842,7 @@ pub async fn register_uploaded_subtitle(
         .unwrap_or(0);
     let sha = full_hash(path).await?;
     let path_s = path.to_string_lossy().to_string();
-    sqlx::query(
+    crate::sqlx::query(
         r#"
 INSERT INTO subtitle_files(path, root_label, relative_path, size, mtime, sha256)
 VALUES(?, 'uploads', ?, ?, ?, ?)
@@ -860,10 +861,11 @@ ON CONFLICT(path) DO UPDATE SET
     .bind(sha)
     .execute(&state.db.pool)
     .await?;
-    let subtitle_id: i64 = sqlx::query_scalar("SELECT id FROM subtitle_files WHERE path = ?")
-        .bind(&path_s)
-        .fetch_one(&state.db.pool)
-        .await?;
+    let subtitle_id: i64 =
+        crate::sqlx::query_scalar("SELECT id FROM subtitle_files WHERE path = ?")
+            .bind(&path_s)
+            .fetch_one(&state.db.pool)
+            .await?;
     Ok(subtitle_id)
 }
 
@@ -872,13 +874,13 @@ pub async fn enqueue_subtitle_id(
     subtitle_id: i64,
     mode: JobMode,
 ) -> anyhow::Result<i64> {
-    let row = sqlx::query("SELECT path FROM subtitle_files WHERE id = ?")
+    let row = crate::sqlx::query("SELECT path FROM subtitle_files WHERE id = ?")
         .bind(subtitle_id)
         .fetch_one(&state.db.pool)
         .await?;
     let path: String = row.get("path");
     let now = Utc::now().to_rfc3339();
-    let job_id: Option<i64> = sqlx::query_scalar(
+    let job_id: Option<i64> = crate::sqlx::query_scalar(
         r#"
 INSERT INTO jobs(subtitle_id, path, mode, status, queued_at)
 SELECT ?, ?, ?, 'queued', ?
@@ -905,7 +907,7 @@ RETURNING id
 }
 
 pub async fn retry_job(state: &Arc<AppState>, job_id: i64) -> anyhow::Result<i64> {
-    let row = sqlx::query("SELECT subtitle_id, mode FROM jobs WHERE id = ?")
+    let row = crate::sqlx::query("SELECT subtitle_id, mode FROM jobs WHERE id = ?")
         .bind(job_id)
         .fetch_one(&state.db.pool)
         .await?;
@@ -943,7 +945,7 @@ async fn full_hash(path: &Path) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::sqlite::SqlitePoolOptions;
+    use crate::sqlx::sqlite::SqlitePoolOptions;
 
     #[tokio::test]
     async fn candidate_inspection_stops_hashing_after_subset_marker() {
@@ -976,13 +978,13 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::query(
+        crate::sqlx::query(
             "CREATE TABLE subtitle_files (id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT NOT NULL UNIQUE, root_label TEXT NOT NULL, relative_path TEXT NOT NULL, size INTEGER NOT NULL, mtime INTEGER NOT NULL, sha256 TEXT NOT NULL)",
         )
         .execute(&pool)
         .await
         .unwrap();
-        sqlx::query(
+        crate::sqlx::query(
             "CREATE TABLE jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, subtitle_id INTEGER NOT NULL, path TEXT NOT NULL, mode TEXT NOT NULL, status TEXT NOT NULL, queued_at TEXT NOT NULL)",
         )
         .execute(&pool)
@@ -1017,7 +1019,7 @@ mod tests {
                 .is_none()
         );
         second_tx.commit().await.unwrap();
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM jobs")
+        let count: i64 = crate::sqlx::query_scalar("SELECT COUNT(*) FROM jobs")
             .fetch_one(&pool)
             .await
             .unwrap();

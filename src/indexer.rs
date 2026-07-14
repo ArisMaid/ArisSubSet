@@ -3,9 +3,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::sqlx::{QueryBuilder, Row, Sqlite, Transaction};
 use anyhow::anyhow;
 use chrono::Utc;
-use sqlx::{QueryBuilder, Row, Sqlite, Transaction};
 use tokio::task::JoinSet;
 
 use crate::ass::normalize_lookup_name;
@@ -186,7 +186,7 @@ pub async fn rebuild_index_reserved(
 async fn load_existing_font_meta(
     state: &Arc<AppState>,
 ) -> anyhow::Result<HashMap<String, ExistingMeta>> {
-    let rows = sqlx::query("SELECT id, path, size, mtime, status FROM font_files")
+    let rows = crate::sqlx::query("SELECT id, path, size, mtime, status FROM font_files")
         .fetch_all(&state.db.pool)
         .await?;
     let mut out = HashMap::with_capacity(rows.len());
@@ -401,7 +401,7 @@ async fn upsert_font_ok(
     indexed_at: &str,
 ) -> anyhow::Result<i64> {
     if let Some(id) = meta.existing_id {
-        sqlx::query(
+        crate::sqlx::query(
             r#"
 UPDATE font_files SET
   size=?,
@@ -425,7 +425,7 @@ WHERE id=?
         return Ok(id);
     }
 
-    let result = sqlx::query(
+    let result = crate::sqlx::query(
         r#"
 INSERT INTO font_files(path, size, mtime, quick_hash, full_hash, format, status, error, indexed_at)
 VALUES(?, ?, ?, '', '', ?, 'ok', NULL, ?)
@@ -448,7 +448,7 @@ async fn upsert_font_error(
     indexed_at: &str,
 ) -> anyhow::Result<()> {
     if let Some(id) = meta.existing_id {
-        sqlx::query(
+        crate::sqlx::query(
             r#"
 UPDATE font_files SET
   size=?,
@@ -473,7 +473,7 @@ WHERE id=?
         return Ok(());
     }
 
-    sqlx::query(
+    crate::sqlx::query(
         r#"
 INSERT INTO font_files(path, size, mtime, quick_hash, full_hash, format, status, error, indexed_at)
 VALUES(?, ?, ?, '', '', ?, 'error', ?, ?)
@@ -491,13 +491,13 @@ VALUES(?, ?, ?, '', '', ?, 'error', ?, ?)
 }
 
 async fn clear_font_faces(tx: &mut Transaction<'_, Sqlite>, file_id: i64) -> anyhow::Result<()> {
-    sqlx::query(
+    crate::sqlx::query(
         "DELETE FROM font_names WHERE face_id IN (SELECT id FROM font_faces WHERE file_id = ?)",
     )
     .bind(file_id)
     .execute(&mut **tx)
     .await?;
-    sqlx::query("DELETE FROM font_faces WHERE file_id = ?")
+    crate::sqlx::query("DELETE FROM font_faces WHERE file_id = ?")
         .bind(file_id)
         .execute(&mut **tx)
         .await?;
@@ -509,7 +509,7 @@ async fn insert_face(
     file_id: i64,
     face: &FontFaceInfo,
 ) -> anyhow::Result<i64> {
-    let result = sqlx::query(
+    let result = crate::sqlx::query(
         r#"
 INSERT INTO font_faces(file_id, ttc_index, family, full_name, postscript_name, subfamily, version, weight, italic)
 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)

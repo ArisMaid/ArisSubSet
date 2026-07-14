@@ -1,9 +1,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::sqlx::Row;
 use anyhow::{Context, bail};
 use chrono::{Duration as ChronoDuration, Utc};
-use sqlx::Row;
 
 use crate::state::AppState;
 
@@ -21,10 +21,11 @@ pub async fn create(
     source: &Path,
     source_sha: &str,
 ) -> anyhow::Result<PathBuf> {
-    let row = sqlx::query("SELECT root_label, relative_path FROM subtitle_files WHERE id = ?")
-        .bind(subtitle_id)
-        .fetch_one(&state.db.pool)
-        .await?;
+    let row =
+        crate::sqlx::query("SELECT root_label, relative_path FROM subtitle_files WHERE id = ?")
+            .bind(subtitle_id)
+            .fetch_one(&state.db.pool)
+            .await?;
     let root_label: String = row.get("root_label");
     let relative_path: String = row.get("relative_path");
     let rel = Path::new(&relative_path);
@@ -46,7 +47,7 @@ pub async fn create(
     tokio::fs::create_dir_all(&backup_dir).await?;
     let backup_path = backup_dir.join(backup_name);
     tokio::fs::copy(source, &backup_path).await?;
-    sqlx::query(
+    crate::sqlx::query(
         "INSERT INTO backups(subtitle_id, source_path, backup_path, source_sha256, created_at) VALUES(?, ?, ?, ?, ?)",
     )
     .bind(subtitle_id)
@@ -69,7 +70,7 @@ pub async fn prune_expired(state: &Arc<AppState>) -> anyhow::Result<BackupPruneS
         .checked_sub_signed(ChronoDuration::days(retention_days))
         .unwrap_or(chrono::DateTime::<Utc>::MIN_UTC)
         .to_rfc3339();
-    let rows = sqlx::query(
+    let rows = crate::sqlx::query(
         "SELECT id, backup_path FROM backups WHERE created_at < ? ORDER BY created_at ASC, id ASC",
     )
     .bind(cutoff)
@@ -142,7 +143,7 @@ pub async fn prune_expired(state: &Arc<AppState>) -> anyhow::Result<BackupPruneS
 }
 
 pub async fn restore(state: &Arc<AppState>, backup_id: i64) -> anyhow::Result<()> {
-    let row = sqlx::query("SELECT source_path, backup_path FROM backups WHERE id = ?")
+    let row = crate::sqlx::query("SELECT source_path, backup_path FROM backups WHERE id = ?")
         .bind(backup_id)
         .fetch_one(&state.db.pool)
         .await?;
@@ -161,7 +162,7 @@ pub async fn restore(state: &Arc<AppState>, backup_id: i64) -> anyhow::Result<()
 }
 
 async fn delete_record(state: &Arc<AppState>, id: i64) -> anyhow::Result<()> {
-    sqlx::query("DELETE FROM backups WHERE id = ?")
+    crate::sqlx::query("DELETE FROM backups WHERE id = ?")
         .bind(id)
         .execute(&state.db.pool)
         .await?;

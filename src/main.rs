@@ -15,6 +15,7 @@ mod metrics;
 mod models;
 mod processor;
 mod scanner;
+mod sqlx;
 mod state;
 
 use std::sync::Arc;

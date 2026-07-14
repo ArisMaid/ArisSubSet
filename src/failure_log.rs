@@ -1,9 +1,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::sqlx::Row;
 use anyhow::Context;
 use chrono::Utc;
-use sqlx::Row;
 use tokio::io::AsyncWriteExt;
 
 use crate::state::AppState;
@@ -27,7 +27,7 @@ struct FailedJobLogEntry<'a> {
 
 pub async fn export(state: &Arc<AppState>) -> anyhow::Result<FailedJobLogExport> {
     let _guard = state.failed_log_lock.lock().await;
-    let rows = sqlx::query(
+    let rows = crate::sqlx::query(
         r#"
 SELECT id, subtitle_id, path, mode, message
 FROM jobs

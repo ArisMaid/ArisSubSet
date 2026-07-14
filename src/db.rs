@@ -1,9 +1,11 @@
 use std::str::FromStr;
 use std::time::Duration;
 
+use crate::sqlx::sqlite::{
+    SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
+};
+use crate::sqlx::{Executor, Row, SqlitePool};
 use anyhow::Context;
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
-use sqlx::{Executor, Row, SqlitePool};
 
 use crate::config::Config;
 
@@ -19,13 +21,13 @@ pub struct Db {
 }
 
 async fn add_column_if_missing(
-    conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    conn: &mut crate::sqlx::pool::PoolConnection<crate::sqlx::Sqlite>,
     table: &str,
     column: &str,
     definition: &str,
 ) -> anyhow::Result<()> {
     let pragma = format!("PRAGMA table_info({table})");
-    let rows = sqlx::query(&pragma).fetch_all(&mut **conn).await?;
+    let rows = crate::sqlx::query(&pragma).fetch_all(&mut **conn).await?;
     let exists = rows.iter().any(|row| {
         let name: String = row.get("name");
         name == column
@@ -64,7 +66,7 @@ impl Db {
         conn.execute("PRAGMA foreign_keys = ON;").await?;
         execute_script(&mut conn, MIGRATION_TABLE_SQL).await?;
         execute_script(&mut conn, BASELINE_SQL).await?;
-        let face_identity_index_exists: i64 = sqlx::query_scalar(
+        let face_identity_index_exists: i64 = crate::sqlx::query_scalar(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_font_faces_file_ttc'",
         )
         .fetch_one(&mut *conn)
@@ -99,7 +101,7 @@ impl Db {
 }
 
 async fn execute_script(
-    conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    conn: &mut crate::sqlx::pool::PoolConnection<crate::sqlx::Sqlite>,
     script: &str,
 ) -> anyhow::Result<()> {
     for statement in script
@@ -113,11 +115,11 @@ async fn execute_script(
 }
 
 async fn record_migration(
-    conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    conn: &mut crate::sqlx::pool::PoolConnection<crate::sqlx::Sqlite>,
     version: i64,
     description: &str,
 ) -> anyhow::Result<()> {
-    sqlx::query(
+    crate::sqlx::query(
         "INSERT OR IGNORE INTO schema_migrations(version, description, applied_at) VALUES(?, ?, ?)",
     )
     .bind(version)
@@ -143,25 +145,25 @@ mod tests {
         db.migrate().await.unwrap();
         db.migrate().await.unwrap();
 
-        let analysis_column: i64 = sqlx::query_scalar(
+        let analysis_column: i64 = crate::sqlx::query_scalar(
             "SELECT COUNT(*) FROM pragma_table_info('subtitle_files') WHERE name='analysis'",
         )
         .fetch_one(&db.pool)
         .await
         .unwrap();
-        let active_index: i64 = sqlx::query_scalar(
+        let active_index: i64 = crate::sqlx::query_scalar(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_jobs_one_active_per_subtitle'",
         )
         .fetch_one(&db.pool)
         .await
         .unwrap();
-        let face_identity_index: i64 = sqlx::query_scalar(
+        let face_identity_index: i64 = crate::sqlx::query_scalar(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_font_faces_file_ttc'",
         )
         .fetch_one(&db.pool)
         .await
         .unwrap();
-        let migrations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations")
+        let migrations: i64 = crate::sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations")
             .fetch_one(&db.pool)
             .await
             .unwrap();
@@ -180,11 +182,11 @@ mod tests {
             .unwrap();
         let db = Db { pool };
         db.migrate().await.unwrap();
-        sqlx::query("DROP INDEX idx_font_faces_file_ttc")
+        crate::sqlx::query("DROP INDEX idx_font_faces_file_ttc")
             .execute(&db.pool)
             .await
             .unwrap();
-        let file_id: i64 = sqlx::query_scalar(
+        let file_id: i64 = crate::sqlx::query_scalar(
             r#"
 INSERT INTO font_files(path, size, mtime, quick_hash, full_hash, format, status, indexed_at)
 VALUES('/fonts/example.ttc', 1, 1, '', '', 'ttc', 'ok', 'now')
@@ -195,7 +197,7 @@ RETURNING id
         .await
         .unwrap();
         for _ in 0..2 {
-            sqlx::query("INSERT INTO font_faces(file_id, ttc_index) VALUES(?, 0)")
+            crate::sqlx::query("INSERT INTO font_faces(file_id, ttc_index) VALUES(?, 0)")
                 .bind(file_id)
                 .execute(&db.pool)
                 .await
@@ -204,12 +206,13 @@ RETURNING id
 
         db.migrate().await.unwrap();
 
-        let faces: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM font_faces WHERE file_id=? AND ttc_index=0")
-                .bind(file_id)
-                .fetch_one(&db.pool)
-                .await
-                .unwrap();
+        let faces: i64 = crate::sqlx::query_scalar(
+            "SELECT COUNT(*) FROM font_faces WHERE file_id=? AND ttc_index=0",
+        )
+        .bind(file_id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
         assert_eq!(faces, 1);
     }
 }

@@ -4,6 +4,7 @@ use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::sqlx::{QueryBuilder, Row, Sqlite};
 use async_stream::stream;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Multipart, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
@@ -12,7 +13,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use sqlx::{QueryBuilder, Row, Sqlite};
 use tokio::io::AsyncWriteExt;
 use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
@@ -151,7 +151,7 @@ struct StatusResponse {
 }
 
 async fn healthz(State(state): State<Arc<AppState>>) -> Response {
-    let query = sqlx::query_scalar::<_, i64>("SELECT 1").fetch_one(&state.db.pool);
+    let query = crate::sqlx::query_scalar::<_, i64>("SELECT 1").fetch_one(&state.db.pool);
     match tokio::time::timeout(Duration::from_secs(2), query).await {
         Ok(Ok(_)) => Json(serde_json::json!({
             "status": "ok",
@@ -187,7 +187,7 @@ async fn status(
             capabilities: capabilities(),
         }));
     }
-    let counts = sqlx::query(
+    let counts = crate::sqlx::query(
         r#"
 SELECT
   (SELECT COUNT(*) FROM font_files WHERE status='ok') AS font_files,
@@ -809,7 +809,7 @@ async fn file_analysis(
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     auth::require_auth(&state, &headers, false).await?;
-    let row = sqlx::query(
+    let row = crate::sqlx::query(
         "SELECT path, size, mtime, analysis, analysis_size, analysis_mtime FROM subtitle_files WHERE id = ?",
     )
     .bind(id)
@@ -834,7 +834,7 @@ async fn file_analysis(
 
     let analysis = analyze_subtitle_file(&path).await;
     if !analysis.is_null() {
-        sqlx::query(
+        crate::sqlx::query(
             "UPDATE subtitle_files SET analysis=?, analysis_size=?, analysis_mtime=? WHERE id=? AND size=? AND mtime=?",
         )
         .bind(analysis.to_string())
@@ -872,7 +872,7 @@ async fn download_file(
     Path(id): Path<i64>,
 ) -> Result<Response, StatusCode> {
     auth::require_auth(&state, &headers, false).await?;
-    let row = sqlx::query("SELECT path, relative_path FROM subtitle_files WHERE id = ?")
+    let row = crate::sqlx::query("SELECT path, relative_path FROM subtitle_files WHERE id = ?")
         .bind(id)
         .fetch_one(&state.db.pool)
         .await

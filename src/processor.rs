@@ -5,13 +5,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::sqlx::Row;
 use anyhow::{Context, bail};
 use base64::{Engine, engine::general_purpose};
 use chrono::Utc;
 use filetime::{FileTime, set_file_mtime};
 use fs2::FileExt;
 use sha2::{Digest, Sha256};
-use sqlx::Row;
 use tokio::io::AsyncReadExt;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinSet;
@@ -118,10 +118,10 @@ pub fn spawn_controlled_job_loop(mut rx: mpsc::Receiver<i64>, state: Arc<AppStat
 }
 
 pub async fn recover_incomplete_jobs(state: Arc<AppState>) -> anyhow::Result<usize> {
-    sqlx::query("UPDATE jobs SET status='queued', started_at=NULL WHERE status='running'")
+    crate::sqlx::query("UPDATE jobs SET status='queued', started_at=NULL WHERE status='running'")
         .execute(&state.db.pool)
         .await?;
-    let rows = sqlx::query("SELECT id FROM jobs WHERE status='queued' ORDER BY id ASC")
+    let rows = crate::sqlx::query("SELECT id FROM jobs WHERE status='queued' ORDER BY id ASC")
         .fetch_all(&state.db.pool)
         .await?;
     let mut count = 0usize;
@@ -147,7 +147,7 @@ async fn acquire_job_memory(
     job_id: i64,
     memory: Arc<Semaphore>,
 ) -> anyhow::Result<OwnedSemaphorePermit> {
-    let size: i64 = sqlx::query_scalar(
+    let size: i64 = crate::sqlx::query_scalar(
         "SELECT sf.size FROM jobs j JOIN subtitle_files sf ON sf.id=j.subtitle_id WHERE j.id=?",
     )
     .bind(job_id)
@@ -186,10 +186,11 @@ struct ProcessStats {
 }
 
 async fn process_job(state: Arc<AppState>, job_id: i64) -> anyhow::Result<()> {
-    let row = sqlx::query("SELECT subtitle_id, path, mode, queued_at FROM jobs WHERE id = ?")
-        .bind(job_id)
-        .fetch_one(&state.db.pool)
-        .await?;
+    let row =
+        crate::sqlx::query("SELECT subtitle_id, path, mode, queued_at FROM jobs WHERE id = ?")
+            .bind(job_id)
+            .fetch_one(&state.db.pool)
+            .await?;
     let subtitle_id: i64 = row.get("subtitle_id");
     let path: String = row.get("path");
     let mode = JobMode::from_db(&row.get::<String, _>("mode"));
@@ -221,7 +222,7 @@ async fn process_subset_job(
     let font_index_revision = state.font_index_revision().await;
     let path_buf = PathBuf::from(&path);
     let started = Utc::now().to_rfc3339();
-    sqlx::query("UPDATE jobs SET status='running', started_at=?, message=NULL WHERE id=?")
+    crate::sqlx::query("UPDATE jobs SET status='running', started_at=?, message=NULL WHERE id=?")
         .bind(started)
         .bind(job_id)
         .execute(&state.db.pool)
@@ -356,7 +357,7 @@ async fn process_subset_job(
         )
     };
 
-    sqlx::query(
+    crate::sqlx::query(
         "UPDATE jobs SET status=?, finished_at=?, message=?, missing_fonts=?, stats=? WHERE id=?",
     )
     .bind(status)
@@ -367,7 +368,7 @@ async fn process_subset_job(
     .bind(job_id)
     .execute(&state.db.pool)
     .await?;
-    sqlx::query(
+    crate::sqlx::query(
         r#"
 UPDATE subtitle_files
 SET size=?, mtime=?, sha256=?, last_config_hash=?, last_status=?, last_processed_at=?,
@@ -407,7 +408,7 @@ async fn process_strip_job(
     let font_index_revision = state.font_index_revision().await;
     let path_buf = PathBuf::from(&path);
     let started = Utc::now().to_rfc3339();
-    sqlx::query("UPDATE jobs SET status='running', started_at=?, message=NULL WHERE id=?")
+    crate::sqlx::query("UPDATE jobs SET status='running', started_at=?, message=NULL WHERE id=?")
         .bind(started)
         .bind(job_id)
         .execute(&state.db.pool)
@@ -531,7 +532,7 @@ async fn process_strip_job(
             warnings.len()
         )
     };
-    sqlx::query(
+    crate::sqlx::query(
         "UPDATE jobs SET status=?, finished_at=?, message=?, missing_fonts=?, stats=? WHERE id=?",
     )
     .bind(status)
@@ -542,7 +543,7 @@ async fn process_strip_job(
     .bind(job_id)
     .execute(&state.db.pool)
     .await?;
-    sqlx::query(
+    crate::sqlx::query(
         r#"
 UPDATE subtitle_files
 SET size=?, mtime=?, sha256=?, last_config_hash=?, last_status=?, last_processed_at=?,
@@ -868,7 +869,7 @@ async fn ensure_candidate_full_hash(
         .await;
     let _cache_guard = cache_lock.lock().await;
     let existing: Option<String> =
-        sqlx::query_scalar("SELECT full_hash FROM font_files WHERE id = ?")
+        crate::sqlx::query_scalar("SELECT full_hash FROM font_files WHERE id = ?")
             .bind(candidate.file_id)
             .fetch_optional(&state.db.pool)
             .await?;
@@ -876,7 +877,7 @@ async fn ensure_candidate_full_hash(
         return Ok(existing);
     }
     let hash = sha256_file(Path::new(&candidate.path)).await?;
-    sqlx::query("UPDATE font_files SET full_hash = ? WHERE id = ? AND full_hash = ''")
+    crate::sqlx::query("UPDATE font_files SET full_hash = ? WHERE id = ? AND full_hash = ''")
         .bind(&hash)
         .bind(candidate.file_id)
         .execute(&state.db.pool)
@@ -889,7 +890,7 @@ async fn query_candidates(
     font_name: &str,
 ) -> anyhow::Result<Vec<FontCandidate>> {
     let normalized = normalize_lookup_name(font_name);
-    let rows = sqlx::query(
+    let rows = crate::sqlx::query(
         r#"
 SELECT DISTINCT
   f.id AS file_id,
@@ -983,13 +984,13 @@ fn read_locked_sync(path: &Path) -> anyhow::Result<Vec<u8>> {
 
 async fn fail_job(state: &Arc<AppState>, job_id: i64, error: &str) -> anyhow::Result<()> {
     let finished = Utc::now().to_rfc3339();
-    sqlx::query("UPDATE jobs SET status='failed', finished_at=?, message=? WHERE id=?")
+    crate::sqlx::query("UPDATE jobs SET status='failed', finished_at=?, message=? WHERE id=?")
         .bind(&finished)
         .bind(error)
         .bind(job_id)
         .execute(&state.db.pool)
         .await?;
-    if let Some(row) = sqlx::query("SELECT subtitle_id, path, mode FROM jobs WHERE id=?")
+    if let Some(row) = crate::sqlx::query("SELECT subtitle_id, path, mode FROM jobs WHERE id=?")
         .bind(job_id)
         .fetch_optional(&state.db.pool)
         .await?
@@ -997,7 +998,7 @@ async fn fail_job(state: &Arc<AppState>, job_id: i64, error: &str) -> anyhow::Re
         let subtitle_id: i64 = row.get("subtitle_id");
         let path: String = row.get("path");
         let mode: String = row.get("mode");
-        sqlx::query("UPDATE subtitle_files SET last_status='failed', error=? WHERE id=?")
+        crate::sqlx::query("UPDATE subtitle_files SET last_status='failed', error=? WHERE id=?")
             .bind(error)
             .bind(subtitle_id)
             .execute(&state.db.pool)
@@ -1023,7 +1024,7 @@ async fn fail_job(state: &Arc<AppState>, job_id: i64, error: &str) -> anyhow::Re
 
 async fn cancel_job(state: &Arc<AppState>, job_id: i64, message: &str) -> anyhow::Result<()> {
     let finished = Utc::now().to_rfc3339();
-    sqlx::query("UPDATE jobs SET status='cancelled', finished_at=?, message=? WHERE id=?")
+    crate::sqlx::query("UPDATE jobs SET status='cancelled', finished_at=?, message=? WHERE id=?")
         .bind(&finished)
         .bind(message)
         .bind(job_id)
@@ -1034,7 +1035,7 @@ async fn cancel_job(state: &Arc<AppState>, job_id: i64, message: &str) -> anyhow
 
 pub async fn cancel_queued_jobs(state: &Arc<AppState>) -> anyhow::Result<u64> {
     let finished = Utc::now().to_rfc3339();
-    let result = sqlx::query(
+    let result = crate::sqlx::query(
         "UPDATE jobs SET status='cancelled', finished_at=?, message='cancelled before start' WHERE status='queued'",
     )
     .bind(finished)
@@ -1044,7 +1045,7 @@ pub async fn cancel_queued_jobs(state: &Arc<AppState>) -> anyhow::Result<u64> {
 }
 
 async fn job_is_runnable(state: &Arc<AppState>, job_id: i64) -> anyhow::Result<bool> {
-    let status: Option<String> = sqlx::query_scalar("SELECT status FROM jobs WHERE id=?")
+    let status: Option<String> = crate::sqlx::query_scalar("SELECT status FROM jobs WHERE id=?")
         .bind(job_id)
         .fetch_optional(&state.db.pool)
         .await?;

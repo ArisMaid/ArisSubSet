@@ -4,8 +4,8 @@ use std::sync::Weak;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use crate::sqlx::Row;
 use chrono::Utc;
-use sqlx::Row;
 use tokio::sync::{Mutex, RwLock, mpsc, watch};
 
 use crate::auth::{LoginRateLimiter, Session};
@@ -338,7 +338,7 @@ impl AppState {
     }
 
     async fn setting(&self, key: &str) -> anyhow::Result<Option<String>> {
-        let row = sqlx::query("SELECT value FROM runtime_settings WHERE key = ?")
+        let row = crate::sqlx::query("SELECT value FROM runtime_settings WHERE key = ?")
             .bind(key)
             .fetch_optional(&self.db.pool)
             .await?;
@@ -347,7 +347,7 @@ impl AppState {
 
     async fn save_setting(&self, key: &str, value: &str) -> anyhow::Result<()> {
         let now = Utc::now().to_rfc3339();
-        sqlx::query(
+        crate::sqlx::query(
             r#"
 INSERT INTO runtime_settings(key, value, updated_at)
 VALUES(?, ?, ?)
