@@ -1,28 +1,35 @@
 use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_stream::stream;
-use axum::extract::{Multipart, Path, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Multipart, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use sqlx::Row;
+use sqlx::{QueryBuilder, Row, Sqlite};
+use tokio::io::AsyncWriteExt;
 use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 
 use crate::ass::{decode_subtitle, is_system_font, parse_embedded_fonts, parse_subtitle};
 use crate::auth;
+use crate::backup;
 use crate::config::sanitize_path_segment;
+use crate::failure_log;
 use crate::indexer;
 use crate::models::JobMode;
 use crate::processor;
 use crate::scanner;
 use crate::state::AppState;
+
+const MAX_UPLOAD_BYTES: usize = 64 * 1024 * 1024;
+const MULTIPART_OVERHEAD_BYTES: usize = 1024 * 1024;
 
 pub fn router(state: Arc<AppState>) -> Router {
     let web_dir = std::env::var("WEB_DIR").unwrap_or_else(|_| {
@@ -35,6 +42,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 
     Router::new()
         .route("/api/auth/login", post(login))
+        .route("/healthz", get(healthz))
         .route("/api/status", get(status))
         .route("/api/index/rebuild", post(rebuild_index))
         .route("/api/scan", post(scan))
@@ -52,10 +60,17 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(set_conversion_parallelism),
         )
         .route("/api/schedule", post(set_schedule))
-        .route("/api/upload", post(upload_subtitle))
+        .route(
+            "/api/upload",
+            post(upload_subtitle).layer(DefaultBodyLimit::max(
+                MAX_UPLOAD_BYTES + MULTIPART_OVERHEAD_BYTES,
+            )),
+        )
         .route("/api/files", get(files))
+        .route("/api/files/{id}/analysis", get(file_analysis))
         .route("/api/files/{id}/download", get(download_file))
         .route("/api/jobs", get(jobs))
+        .route("/api/jobs/failed-log", post(export_failed_jobs_log))
         .route("/api/jobs/{id}/retry", post(retry_job))
         .route("/api/files/{id}/process", post(process_file))
         .route("/api/files/{id}/strip-embedded", post(strip_embedded_file))
@@ -63,6 +78,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/backups/{id}/restore", post(restore_backup))
         .route("/api/events", get(events))
         .fallback_service(ServeDir::new(web_dir).append_index_html_on_directories(true))
+        .layer(DefaultBodyLimit::max(1024 * 1024))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -78,15 +94,33 @@ struct LoginResponse {
     csrf: String,
 }
 
-async fn login(State(state): State<Arc<AppState>>, Json(req): Json<LoginRequest>) -> Response {
+async fn login(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Json(req): Json<LoginRequest>,
+) -> Response {
     auth::cleanup_sessions(&state).await;
-    if !auth::verify_password(&state, &req.password) {
+    let rate_key = peer.ip().to_string();
+    if let Some(retry_after) = state.login_limiter.retry_after(&rate_key).await {
+        let mut response = (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({"error":"too many login attempts"})),
+        )
+            .into_response();
+        if let Ok(value) = HeaderValue::from_str(&retry_after.to_string()) {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+        return response;
+    }
+    if req.password.len() > 1024 || !auth::verify_password(&state, &req.password).await {
+        state.login_limiter.record_failure(&rate_key).await;
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({"error":"invalid password"})),
         )
             .into_response();
     }
+    state.login_limiter.record_success(&rate_key).await;
     let info = auth::create_session(&state).await;
     let mut resp = Json(LoginResponse {
         ok: true,
@@ -95,53 +129,96 @@ async fn login(State(state): State<Arc<AppState>>, Json(req): Json<LoginRequest>
     .into_response();
     resp.headers_mut().insert(
         header::SET_COOKIE,
-        HeaderValue::from_str(&auth::session_cookie(&info.token)).expect("valid cookie"),
+        HeaderValue::from_str(&auth::session_cookie(
+            &info.token,
+            state.config.secure_cookies,
+        ))
+        .expect("valid cookie"),
     );
     resp
 }
 
 #[derive(Debug, Serialize)]
 struct StatusResponse {
+    version: &'static str,
     fonts: serde_json::Value,
     subtitles: serde_json::Value,
     jobs: serde_json::Value,
     backups: i64,
+    metrics: serde_json::Value,
     config: serde_json::Value,
     capabilities: serde_json::Value,
 }
 
-async fn status(State(state): State<Arc<AppState>>) -> Result<Json<StatusResponse>, StatusCode> {
-    let font_files: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM font_files WHERE status='ok'")
-        .fetch_one(&state.db.pool)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let font_faces: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM font_faces")
-        .fetch_one(&state.db.pool)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let font_errors: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM font_files WHERE status='error'")
-            .fetch_one(&state.db.pool)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let subtitle_files: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM subtitle_files")
-        .fetch_one(&state.db.pool)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let backups: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM backups")
-        .fetch_one(&state.db.pool)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+async fn healthz(State(state): State<Arc<AppState>>) -> Response {
+    let query = sqlx::query_scalar::<_, i64>("SELECT 1").fetch_one(&state.db.pool);
+    match tokio::time::timeout(Duration::from_secs(2), query).await {
+        Ok(Ok(_)) => Json(serde_json::json!({
+            "status": "ok",
+            "version": env!("CARGO_PKG_VERSION"),
+        }))
+        .into_response(),
+        _ => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "status": "unhealthy",
+                "version": env!("CARGO_PKG_VERSION"),
+            })),
+        )
+            .into_response(),
+    }
+}
 
-    let job_rows = sqlx::query("SELECT status, COUNT(*) AS n FROM jobs GROUP BY status")
-        .fetch_all(&state.db.pool)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+async fn status(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<StatusResponse>, StatusCode> {
+    if !state.config.allow_no_auth && auth::require_auth(&state, &headers, false).await.is_err() {
+        return Ok(Json(StatusResponse {
+            version: env!("CARGO_PKG_VERSION"),
+            fonts: serde_json::json!({}),
+            subtitles: serde_json::json!({}),
+            jobs: serde_json::json!({}),
+            backups: 0,
+            metrics: serde_json::json!({}),
+            config: serde_json::json!({
+                "auth_required": true,
+            }),
+            capabilities: capabilities(),
+        }));
+    }
+    let counts = sqlx::query(
+        r#"
+SELECT
+  (SELECT COUNT(*) FROM font_files WHERE status='ok') AS font_files,
+  (SELECT COUNT(*) FROM font_faces) AS font_faces,
+  (SELECT COUNT(*) FROM font_files WHERE status='error') AS font_errors,
+  (SELECT COUNT(*) FROM subtitle_files) AS subtitle_files,
+  (SELECT COUNT(*) FROM backups) AS backups,
+  (SELECT COUNT(*) FROM jobs WHERE status='queued') AS jobs_queued,
+  (SELECT COUNT(*) FROM jobs WHERE status='running') AS jobs_running,
+  (SELECT COUNT(*) FROM jobs WHERE status='success') AS jobs_success,
+  (SELECT COUNT(*) FROM jobs WHERE status='partial') AS jobs_partial,
+  (SELECT COUNT(*) FROM jobs WHERE status='failed') AS jobs_failed,
+  (SELECT COUNT(*) FROM jobs WHERE status='cancelled') AS jobs_cancelled
+"#,
+    )
+    .fetch_one(&state.db.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let mut job_counts = serde_json::Map::new();
-    for row in job_rows {
-        let status: String = row.get("status");
-        let n: i64 = row.get("n");
-        job_counts.insert(status, serde_json::json!(n));
+    for (status, column) in [
+        ("queued", "jobs_queued"),
+        ("running", "jobs_running"),
+        ("success", "jobs_success"),
+        ("partial", "jobs_partial"),
+        ("failed", "jobs_failed"),
+        ("cancelled", "jobs_cancelled"),
+    ] {
+        job_counts.insert(
+            status.to_string(),
+            serde_json::json!(counts.get::<i64, _>(column)),
+        );
     }
     let watch_entries = scanner::watch_dir_entries(&state)
         .await
@@ -162,18 +239,23 @@ async fn status(State(state): State<Arc<AppState>>) -> Result<Json<StatusRespons
     let options = state.processing_options().await;
     let scan_interval = state.scan_interval().await;
     let controls = state.controls().await;
+    let metrics = state
+        .metrics
+        .snapshot(state.config.subset_cache_max_bytes());
 
     Ok(Json(StatusResponse {
+        version: env!("CARGO_PKG_VERSION"),
         fonts: serde_json::json!({
-            "files": font_files,
-            "faces": font_faces,
-            "errors": font_errors,
+            "files": counts.get::<i64, _>("font_files"),
+            "faces": counts.get::<i64, _>("font_faces"),
+            "errors": counts.get::<i64, _>("font_errors"),
         }),
         subtitles: serde_json::json!({
-            "files": subtitle_files,
+            "files": counts.get::<i64, _>("subtitle_files"),
         }),
         jobs: serde_json::Value::Object(job_counts),
-        backups,
+        backups: counts.get("backups"),
+        metrics: serde_json::to_value(metrics).unwrap_or_else(|_| serde_json::json!({})),
         config: serde_json::json!({
             "auth_required": !state.config.allow_no_auth,
             "font_dirs": state.config.font_dirs,
@@ -185,16 +267,24 @@ async fn status(State(state): State<Arc<AppState>>) -> Result<Json<StatusRespons
             "backup_retention_days": state.config.backup_retention_days,
             "max_concurrent_jobs": state.config.max_concurrent_jobs,
             "max_index_concurrency": state.config.max_index_concurrency,
+            "max_scan_concurrency": state.config.max_scan_concurrency,
+            "max_conversion_memory_mb": state.config.max_conversion_memory_mb,
+            "subset_cache_max_mb": state.config.subset_cache_max_mb,
             "controls": controls,
             "options": options,
         }),
-        capabilities: serde_json::json!({
-            "font_subset_map": true,
-            "draw_table_v27": true,
-            "strip_embedded": true,
-            "safe_strip_keeps_unrestorable_fonts": true,
-        }),
+        capabilities: capabilities(),
     }))
+}
+
+fn capabilities() -> serde_json::Value {
+    serde_json::json!({
+        "font_subset_map": true,
+        "draw_table_v27": true,
+        "strip_embedded": true,
+        "safe_strip_keeps_unrestorable_fonts": true,
+        "variable_fonts": true,
+    })
 }
 
 async fn rebuild_index(
@@ -202,10 +292,11 @@ async fn rebuild_index(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     auth::require_auth(&state, &headers, true).await?;
+    let operation = state.try_begin_index().ok_or(StatusCode::CONFLICT)?;
     let st = state.clone();
     tokio::spawn(async move {
         st.events.emit("index", "info", "开始重建字体索引");
-        match indexer::rebuild_index(st.clone()).await {
+        match indexer::rebuild_index_reserved(st.clone(), operation).await {
             Ok(summary) => st.events.emit(
                 "index",
                 "ok",
@@ -229,10 +320,19 @@ async fn scan(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     auth::require_auth(&state, &headers, true).await?;
+    let operation = state.try_begin_scan().ok_or(StatusCode::CONFLICT)?;
     let st = state.clone();
     tokio::spawn(async move {
         st.events.emit("scan", "info", "开始扫描监听目录");
-        match scanner::scan_now(st.clone()).await {
+        match scanner::scan_now_reserved(st.clone(), operation).await {
+            Ok(summary) if summary.cancelled => st.events.emit(
+                "scan",
+                "warn",
+                format!(
+                    "扫描已取消：发现 {}，入队 {}，跳过 {}，失败 {}",
+                    summary.seen, summary.queued, summary.skipped, summary.failed
+                ),
+            ),
             Ok(summary) => st.events.emit(
                 "scan",
                 "ok",
@@ -451,7 +551,7 @@ async fn upload_subtitle(
     while let Some(field) = multipart
         .next_field()
         .await
-        .map_err(|_| StatusCode::BAD_REQUEST)?
+        .map_err(|error| error.status())?
     {
         if field.name() != Some("file") {
             continue;
@@ -475,10 +575,12 @@ async fn upload_subtitle(
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         let path = upload_dir.join(&safe_name);
-        let bytes = field.bytes().await.map_err(|_| StatusCode::BAD_REQUEST)?;
-        tokio::fs::write(&path, &bytes)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let mut field = field;
+        let write_result = stream_upload_field(&mut field, &path).await;
+        if let Err(status) = write_result {
+            cleanup_failed_upload(&path, &upload_dir).await;
+            return Err(status);
+        }
         saved = Some((path, safe_name));
         break;
     }
@@ -501,22 +603,93 @@ async fn upload_subtitle(
     })))
 }
 
+async fn stream_upload_field(
+    field: &mut axum::extract::multipart::Field<'_>,
+    path: &FsPath,
+) -> Result<(), StatusCode> {
+    let mut file = tokio::fs::File::create(path)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut written = 0usize;
+    while let Some(chunk) = field.chunk().await.map_err(|error| error.status())? {
+        written = written
+            .checked_add(chunk.len())
+            .ok_or(StatusCode::PAYLOAD_TOO_LARGE)?;
+        if written > MAX_UPLOAD_BYTES {
+            return Err(StatusCode::PAYLOAD_TOO_LARGE);
+        }
+        file.write_all(&chunk)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+    if written == 0 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    file.flush()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn cleanup_failed_upload(path: &FsPath, upload_dir: &FsPath) {
+    if let Err(error) = tokio::fs::remove_file(path).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(path = %path.display(), %error, "failed to remove partial upload");
+    }
+    if let Err(error) = tokio::fs::remove_dir(upload_dir).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(path = %upload_dir.display(), %error, "failed to remove empty upload directory");
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct JobsQuery {
+    status: Option<String>,
+    mode: Option<String>,
+    cursor: Option<i64>,
+    limit: Option<usize>,
+}
+
 async fn jobs(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Query(params): Query<JobsQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     auth::require_auth(&state, &headers, false).await?;
-    let rows = sqlx::query(
+    let limit = params.limit.unwrap_or(100).clamp(1, 500);
+    let mut query = QueryBuilder::<Sqlite>::new(
         r#"
 SELECT id, subtitle_id, path, mode, status, queued_at, started_at, finished_at, message, missing_fonts, stats
 FROM jobs
-ORDER BY id DESC
-LIMIT 1000
 "#,
-    )
-    .fetch_all(&state.db.pool)
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    );
+    let mut has_where = false;
+    if let Some(status) = params.status.as_deref().filter(|value| !value.is_empty()) {
+        push_where(&mut query, &mut has_where);
+        query.push("status = ").push_bind(status);
+    }
+    if let Some(mode) = params.mode.as_deref().filter(|value| !value.is_empty()) {
+        push_where(&mut query, &mut has_where);
+        query.push("mode = ").push_bind(mode);
+    }
+    if let Some(cursor) = params.cursor {
+        push_where(&mut query, &mut has_where);
+        query.push("id < ").push_bind(cursor);
+    }
+    query
+        .push(" ORDER BY id DESC LIMIT ")
+        .push_bind((limit + 1) as i64);
+    let mut rows = query
+        .build()
+        .fetch_all(&state.db.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let has_more = rows.len() > limit;
+    rows.truncate(limit);
+    let next_cursor = has_more
+        .then(|| rows.last().map(|row| row.get::<i64, _>("id")))
+        .flatten();
     let data: Vec<_> = rows
         .into_iter()
         .map(|r| {
@@ -535,45 +708,162 @@ LIMIT 1000
             })
         })
         .collect();
-    Ok(Json(serde_json::json!({ "jobs": data })))
+    Ok(Json(serde_json::json!({
+        "jobs": data,
+        "next_cursor": next_cursor,
+    })))
+}
+
+async fn export_failed_jobs_log(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    auth::require_auth(&state, &headers, true).await?;
+    let export = failure_log::export(&state)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    state.events.emit(
+        "job",
+        "ok",
+        format!(
+            "failed job log saved: {} ({} items)",
+            export.path, export.count
+        ),
+    );
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "path": export.path,
+        "count": export.count,
+    })))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FilesQuery {
+    status: Option<String>,
+    cursor: Option<i64>,
+    limit: Option<usize>,
 }
 
 async fn files(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Query(params): Query<FilesQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     auth::require_auth(&state, &headers, false).await?;
-    let rows = sqlx::query(
+    let limit = params.limit.unwrap_or(50).clamp(1, 200);
+    let mut query = QueryBuilder::<Sqlite>::new(
         r#"
 SELECT id, path, root_label, relative_path, size, mtime, last_status, last_processed_at,
        missing_fonts, error
 FROM subtitle_files
-ORDER BY id DESC
-LIMIT 200
 "#,
-    )
-    .fetch_all(&state.db.pool)
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let mut data = Vec::with_capacity(rows.len());
-    for r in rows {
-        let path = r.get::<String, _>("path");
-        let analysis = analyze_subtitle_file(&path).await;
-        data.push(serde_json::json!({
-            "id": r.get::<i64, _>("id"),
-            "path": path,
-            "root_label": r.get::<String, _>("root_label"),
-            "relative_path": r.get::<String, _>("relative_path"),
-            "size": r.get::<i64, _>("size"),
-            "mtime": r.get::<i64, _>("mtime"),
-            "last_status": r.get::<Option<String>, _>("last_status"),
-            "last_processed_at": r.get::<Option<String>, _>("last_processed_at"),
-            "missing_fonts": parse_json_opt(r.get::<Option<String>, _>("missing_fonts")),
-            "error": r.get::<Option<String>, _>("error"),
-            "analysis": analysis,
-        }));
+    );
+    let mut has_where = false;
+    if let Some(status) = params.status.as_deref().filter(|value| !value.is_empty()) {
+        push_where(&mut query, &mut has_where);
+        query.push("last_status = ").push_bind(status);
     }
-    Ok(Json(serde_json::json!({ "files": data })))
+    if let Some(cursor) = params.cursor {
+        push_where(&mut query, &mut has_where);
+        query.push("id < ").push_bind(cursor);
+    }
+    query
+        .push(" ORDER BY id DESC LIMIT ")
+        .push_bind((limit + 1) as i64);
+    let mut rows = query
+        .build()
+        .fetch_all(&state.db.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let has_more = rows.len() > limit;
+    rows.truncate(limit);
+    let next_cursor = has_more
+        .then(|| rows.last().map(|row| row.get::<i64, _>("id")))
+        .flatten();
+    let data: Vec<_> = rows
+        .into_iter()
+        .map(|r| {
+            serde_json::json!({
+                "id": r.get::<i64, _>("id"),
+                "path": r.get::<String, _>("path"),
+                "root_label": r.get::<String, _>("root_label"),
+                "relative_path": r.get::<String, _>("relative_path"),
+                "size": r.get::<i64, _>("size"),
+                "mtime": r.get::<i64, _>("mtime"),
+                "last_status": r.get::<Option<String>, _>("last_status"),
+                "last_processed_at": r.get::<Option<String>, _>("last_processed_at"),
+                "missing_fonts": parse_json_opt(r.get::<Option<String>, _>("missing_fonts")),
+                "error": r.get::<Option<String>, _>("error"),
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "files": data,
+        "next_cursor": next_cursor,
+    })))
+}
+
+async fn file_analysis(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    auth::require_auth(&state, &headers, false).await?;
+    let row = sqlx::query(
+        "SELECT path, size, mtime, analysis, analysis_size, analysis_mtime FROM subtitle_files WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(&state.db.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+    let path: String = row.get("path");
+    let size: i64 = row.get("size");
+    let mtime: i64 = row.get("mtime");
+    let cached: Option<String> = row.get("analysis");
+    let cached_size: Option<i64> = row.get("analysis_size");
+    let cached_mtime: Option<i64> = row.get("analysis_mtime");
+    if let Some(analysis) =
+        cached_analysis(cached.as_deref(), cached_size, cached_mtime, size, mtime)
+    {
+        return Ok(Json(serde_json::json!({
+            "analysis": analysis,
+            "cached": true,
+        })));
+    }
+
+    let analysis = analyze_subtitle_file(&path).await;
+    if !analysis.is_null() {
+        sqlx::query(
+            "UPDATE subtitle_files SET analysis=?, analysis_size=?, analysis_mtime=? WHERE id=? AND size=? AND mtime=?",
+        )
+        .bind(analysis.to_string())
+        .bind(size)
+        .bind(mtime)
+        .bind(id)
+        .bind(size)
+        .bind(mtime)
+        .execute(&state.db.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+    Ok(Json(serde_json::json!({
+        "analysis": analysis,
+        "cached": false,
+    })))
+}
+
+fn cached_analysis(
+    cached: Option<&str>,
+    cached_size: Option<i64>,
+    cached_mtime: Option<i64>,
+    size: i64,
+    mtime: i64,
+) -> Option<serde_json::Value> {
+    if cached_size != Some(size) || cached_mtime != Some(mtime) {
+        return None;
+    }
+    serde_json::from_str(cached?).ok()
 }
 
 async fn download_file(
@@ -647,17 +937,38 @@ async fn strip_embedded_file(
     Ok(Json(serde_json::json!({"ok": true, "job_id": job_id})))
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct BackupsQuery {
+    cursor: Option<i64>,
+    limit: Option<usize>,
+}
+
 async fn backups(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Query(params): Query<BackupsQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     auth::require_auth(&state, &headers, false).await?;
-    let rows = sqlx::query(
-        "SELECT id, subtitle_id, source_path, backup_path, source_sha256, created_at FROM backups ORDER BY id DESC LIMIT 200",
-    )
-    .fetch_all(&state.db.pool)
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let limit = params.limit.unwrap_or(100).clamp(1, 500);
+    let mut query = QueryBuilder::<Sqlite>::new(
+        "SELECT id, subtitle_id, source_path, backup_path, source_sha256, created_at FROM backups",
+    );
+    if let Some(cursor) = params.cursor {
+        query.push(" WHERE id < ").push_bind(cursor);
+    }
+    query
+        .push(" ORDER BY id DESC LIMIT ")
+        .push_bind((limit + 1) as i64);
+    let mut rows = query
+        .build()
+        .fetch_all(&state.db.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let has_more = rows.len() > limit;
+    rows.truncate(limit);
+    let next_cursor = has_more
+        .then(|| rows.last().map(|row| row.get::<i64, _>("id")))
+        .flatten();
     let data: Vec<_> = rows
         .into_iter()
         .map(|r| {
@@ -671,7 +982,10 @@ async fn backups(
             })
         })
         .collect();
-    Ok(Json(serde_json::json!({ "backups": data })))
+    Ok(Json(serde_json::json!({
+        "backups": data,
+        "next_cursor": next_cursor,
+    })))
 }
 
 async fn restore_backup(
@@ -680,7 +994,7 @@ async fn restore_backup(
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     auth::require_auth(&state, &headers, true).await?;
-    processor::restore_backup(&state, id)
+    backup::restore(&state, id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(serde_json::json!({"ok": true})))
@@ -707,6 +1021,11 @@ async fn events(
 fn parse_json_opt(raw: Option<String>) -> serde_json::Value {
     raw.and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or(serde_json::Value::Null)
+}
+
+fn push_where(query: &mut QueryBuilder<'_, Sqlite>, has_where: &mut bool) {
+    query.push(if *has_where { " AND " } else { " WHERE " });
+    *has_where = true;
 }
 
 fn option_label(key: &str) -> &str {
@@ -794,5 +1113,22 @@ trait EmptyFallback {
 impl EmptyFallback for str {
     fn if_empty<'a>(&'a self, fallback: &'a str) -> &'a str {
         if self.is_empty() { fallback } else { self }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn analysis_cache_requires_matching_file_fingerprint() {
+        let raw = Some(r#"{"char_count":42}"#);
+        assert_eq!(
+            cached_analysis(raw, Some(100), Some(200), 100, 200).unwrap()["char_count"],
+            42
+        );
+        assert!(cached_analysis(raw, Some(99), Some(200), 100, 200).is_none());
+        assert!(cached_analysis(raw, Some(100), Some(199), 100, 200).is_none());
+        assert!(cached_analysis(Some("not-json"), Some(100), Some(200), 100, 200).is_none());
     }
 }

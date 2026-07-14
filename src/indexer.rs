@@ -7,12 +7,19 @@ use anyhow::anyhow;
 use chrono::Utc;
 use sqlx::{QueryBuilder, Row, Sqlite, Transaction};
 use tokio::task::JoinSet;
-use walkdir::WalkDir;
 
 use crate::ass::normalize_lookup_name;
 use crate::font_worker::InspectResult;
+use crate::fs_walk::{DiscoveredFile, WalkControl, WalkEvent, WalkOptions, spawn_file_walk};
 use crate::models::FontFaceInfo;
-use crate::state::AppState;
+use crate::state::{AppState, OperationGuard};
+
+const FONT_WALK_OPTIONS: WalkOptions = WalkOptions {
+    follow_links: true,
+    extensions: &["ttf", "otf", "ttc", "otc", "woff", "woff2"],
+    ignored_directories: &[],
+};
+const INDEX_WRITE_BATCH_SIZE: usize = 500;
 
 pub fn spawn_initial_index(state: Arc<AppState>) {
     tokio::spawn(async move {
@@ -96,43 +103,46 @@ struct NameInsert {
 }
 
 pub async fn rebuild_index(state: Arc<AppState>) -> anyhow::Result<IndexSummary> {
+    let operation = state
+        .try_begin_index()
+        .ok_or_else(|| anyhow!("font index rebuild is already running"))?;
+    rebuild_index_reserved(state, operation).await
+}
+
+pub async fn rebuild_index_reserved(
+    state: Arc<AppState>,
+    _operation: OperationGuard,
+) -> anyhow::Result<IndexSummary> {
     let existing = load_existing_font_meta(&state).await?;
     let mut summary = IndexSummary::default();
-    let mut changed = Vec::new();
+    let mut changed_batch = Vec::with_capacity(INDEX_WRITE_BATCH_SIZE);
     let mut seen = HashSet::new();
+    let mut authoritative_roots = Vec::new();
     let walk_started = Instant::now();
 
     for root in &state.config.font_dirs {
-        if !root.exists() {
-            state.events.emit(
-                "index",
-                "warn",
-                format!("字体目录不存在：{}", root.display()),
-            );
-            continue;
-        }
-        for entry in WalkDir::new(root)
-            .follow_links(true)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
-            if !entry.file_type().is_file() || !is_font_path(entry.path()) {
-                continue;
-            }
-            summary.scanned += 1;
-            let mut meta = match font_meta(entry.path()) {
-                Ok(meta) => meta,
-                Err(err) => {
+        let (mut walk_events, walk_handle) =
+            spawn_file_walk(root.clone(), FONT_WALK_OPTIONS, WalkControl::new());
+        while let Some(event) = walk_events.recv().await {
+            let file = match event {
+                WalkEvent::File(file) => file,
+                WalkEvent::Error { path, message } => {
                     summary.failed += 1;
                     state.events.emit(
                         "index",
                         "warn",
-                        format!("字体元数据读取失败：{}：{err:#}", entry.path().display()),
+                        format!("字体目录遍历失败：{}：{message}", path.display()),
                     );
                     continue;
                 }
             };
-            seen.insert(meta.path_s.clone());
+            let path_s = file.path.to_string_lossy().to_string();
+            if !seen.insert(path_s) {
+                summary.skipped += 1;
+                continue;
+            }
+            summary.scanned += 1;
+            let mut meta = font_meta(file);
             if let Some(old) = existing.get(&meta.path_s) {
                 if old.size == meta.size && old.mtime == meta.mtime && old.status == "ok" {
                     summary.skipped += 1;
@@ -140,20 +150,36 @@ pub async fn rebuild_index(state: Arc<AppState>) -> anyhow::Result<IndexSummary>
                 }
                 meta.existing_id = Some(old.id);
             }
-            changed.push(meta);
+            changed_batch.push(meta);
+            if changed_batch.len() >= INDEX_WRITE_BATCH_SIZE {
+                inspect_and_write_changed_fonts(
+                    state.clone(),
+                    std::mem::take(&mut changed_batch),
+                    &mut summary,
+                )
+                .await?;
+            }
+        }
+        let walk_result = walk_handle.await?;
+        if walk_result.complete {
+            authoritative_roots.push(root.clone());
         }
     }
 
-    summary.walk_ms = walk_started.elapsed().as_millis();
-    let inspect_started = Instant::now();
-    let (indexed, failed) = inspect_changed_fonts(state.clone(), changed, &mut summary).await;
-    summary.inspect_ms = inspect_started.elapsed().as_millis();
+    summary.walk_ms = walk_started
+        .elapsed()
+        .as_millis()
+        .saturating_sub(summary.inspect_ms)
+        .saturating_sub(summary.write_ms);
+    inspect_and_write_changed_fonts(state.clone(), changed_batch, &mut summary).await?;
     let write_started = Instant::now();
-    write_index_results(&state, indexed, failed).await?;
-    if !seen.is_empty() {
-        summary.pruned = prune_stale_fonts(&state, &existing, &seen).await?;
+    if !authoritative_roots.is_empty() {
+        summary.pruned = prune_stale_fonts(&state, &existing, &seen, &authoritative_roots).await?;
     }
-    summary.write_ms = write_started.elapsed().as_millis();
+    if summary.indexed > 0 || summary.failed > 0 || summary.pruned > 0 {
+        state.bump_font_index_revision().await?;
+    }
+    summary.write_ms += write_started.elapsed().as_millis();
     Ok(summary)
 }
 
@@ -182,10 +208,11 @@ async fn prune_stale_fonts(
     state: &Arc<AppState>,
     existing: &HashMap<String, ExistingMeta>,
     seen: &HashSet<String>,
+    authoritative_roots: &[PathBuf],
 ) -> anyhow::Result<usize> {
     let stale_ids: Vec<i64> = existing
         .iter()
-        .filter(|(path, _)| !seen.contains(*path))
+        .filter(|(path, _)| !seen.contains(*path) && path_is_under_roots(path, authoritative_roots))
         .map(|(_, meta)| meta.id)
         .collect();
     if stale_ids.is_empty() {
@@ -213,11 +240,20 @@ async fn prune_stale_fonts(
     Ok(pruned)
 }
 
-async fn inspect_changed_fonts(
+fn path_is_under_roots(path: &str, roots: &[PathBuf]) -> bool {
+    roots.iter().any(|root| Path::new(path).starts_with(root))
+}
+
+async fn inspect_and_write_changed_fonts(
     state: Arc<AppState>,
     changed: Vec<FontMeta>,
     summary: &mut IndexSummary,
-) -> (Vec<IndexedFont>, Vec<FailedFont>) {
+) -> anyhow::Result<()> {
+    if changed.is_empty() {
+        return Ok(());
+    }
+    let started = Instant::now();
+    let write_before = summary.write_ms;
     let concurrency = state.config.max_index_concurrency;
     let mut tasks = JoinSet::new();
     let mut indexed = Vec::new();
@@ -226,6 +262,8 @@ async fn inspect_changed_fonts(
     for meta in changed {
         while tasks.len() >= concurrency {
             collect_inspect_task(&mut tasks, summary, &mut indexed, &mut failed).await;
+            summary.write_ms +=
+                flush_index_batch_if_ready(&state, &mut indexed, &mut failed, false).await?;
         }
         let st = state.clone();
         tasks.spawn(async move {
@@ -236,9 +274,30 @@ async fn inspect_changed_fonts(
 
     while !tasks.is_empty() {
         collect_inspect_task(&mut tasks, summary, &mut indexed, &mut failed).await;
+        summary.write_ms +=
+            flush_index_batch_if_ready(&state, &mut indexed, &mut failed, false).await?;
     }
+    summary.write_ms += flush_index_batch_if_ready(&state, &mut indexed, &mut failed, true).await?;
+    let write_elapsed = summary.write_ms.saturating_sub(write_before);
+    summary.inspect_ms += started.elapsed().as_millis().saturating_sub(write_elapsed);
+    Ok(())
+}
 
-    (indexed, failed)
+async fn flush_index_batch_if_ready(
+    state: &Arc<AppState>,
+    indexed: &mut Vec<IndexedFont>,
+    failed: &mut Vec<FailedFont>,
+    force: bool,
+) -> anyhow::Result<u128> {
+    if !force && indexed.len() + failed.len() < INDEX_WRITE_BATCH_SIZE {
+        return Ok(0);
+    }
+    if indexed.is_empty() && failed.is_empty() {
+        return Ok(0);
+    }
+    let started = Instant::now();
+    write_index_results(state, std::mem::take(indexed), std::mem::take(failed)).await?;
+    Ok(started.elapsed().as_millis())
 }
 
 async fn collect_inspect_task(
@@ -539,39 +598,33 @@ async fn insert_font_names(
     Ok(())
 }
 
-fn font_meta(path: &Path) -> anyhow::Result<FontMeta> {
-    let meta = std::fs::metadata(path)?;
-    let mtime = meta
-        .modified()
-        .ok()
-        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    Ok(FontMeta {
-        path: path.to_path_buf(),
-        path_s: path.to_string_lossy().to_string(),
-        size: meta.len() as i64,
-        mtime,
-        format: path
-            .extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase(),
+fn font_meta(file: DiscoveredFile) -> FontMeta {
+    let path_s = file.path.to_string_lossy().to_string();
+    let format = file
+        .path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    FontMeta {
+        path: file.path,
+        path_s,
+        size: file.size,
+        mtime: file.mtime,
+        format,
         existing_id: None,
-    })
+    }
 }
 
-pub fn is_font_path(path: &Path) -> bool {
-    matches!(
-        path.extension()
-            .and_then(|s| s.to_str())
-            .map(|s| s.to_ascii_lowercase())
-            .as_deref(),
-        Some("ttf" | "otf" | "ttc" | "otc" | "woff" | "woff2")
-    )
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-#[allow(dead_code)]
-fn _canonicalize_lossy(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+    #[test]
+    fn stale_pruning_is_scoped_to_fully_scanned_roots() {
+        let roots = vec![PathBuf::from("/fonts/ready")];
+        assert!(path_is_under_roots("/fonts/ready/a.ttf", &roots));
+        assert!(!path_is_under_roots("/fonts/unavailable/a.ttf", &roots));
+        assert!(!path_is_under_roots("/fonts/ready-other/a.ttf", &roots));
+    }
 }

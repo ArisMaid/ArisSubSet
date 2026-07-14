@@ -1,4 +1,5 @@
 export type StatusResponse = {
+  version?: string;
   fonts: {
     files?: number;
     faces?: number;
@@ -9,11 +10,48 @@ export type StatusResponse = {
   };
   jobs: Record<string, number | undefined>;
   backups?: number;
+  metrics?: {
+    uptime_seconds?: number;
+    cache?: {
+      hits?: number;
+      misses?: number;
+      hit_rate_percent?: number;
+      files?: number;
+      bytes?: number;
+      max_bytes?: number;
+      evictions?: number;
+      evicted_bytes?: number;
+    };
+    queue?: {
+      samples?: number;
+      average_ms?: number;
+      p50_ms?: number;
+      p95_ms?: number;
+      max_ms?: number;
+    };
+    conversions?: {
+      started?: number;
+      succeeded?: number;
+      failed?: number;
+      duration?: {
+        samples?: number;
+        average_ms?: number;
+        p50_ms?: number;
+        p95_ms?: number;
+        max_ms?: number;
+      };
+    };
+    workers?: {
+      requests?: number;
+      restarts?: number;
+    };
+  };
   capabilities?: {
     font_subset_map?: boolean;
     draw_table_v27?: boolean;
     strip_embedded?: boolean;
     safe_strip_keeps_unrestorable_fonts?: boolean;
+    variable_fonts?: boolean;
   };
   config: {
     auth_required?: boolean;
@@ -29,12 +67,29 @@ export type StatusResponse = {
     backup_retention_days?: number;
     max_concurrent_jobs?: number;
     max_index_concurrency?: number;
+    max_scan_concurrency?: number;
+    max_conversion_memory_mb?: number;
+    subset_cache_max_mb?: number;
     controls?: {
       scan_paused?: boolean;
       scan_cancel_requested?: boolean;
       conversion_paused?: boolean;
       conversion_cancel_requested?: boolean;
       conversion_parallelism?: number;
+      scan_running?: boolean;
+      index_running?: boolean;
+      scan_progress?: {
+        stage?: string;
+        current?: number;
+        total?: number;
+        seen?: number;
+        ready?: number;
+        queued?: number;
+        skipped?: number;
+        failed?: number;
+        started_at?: string | null;
+        updated_at?: string | null;
+      };
     };
     options?: Record<string, boolean | undefined>;
   };
@@ -71,6 +126,7 @@ export type Job = {
 
 export type JobsResponse = {
   jobs: Job[];
+  next_cursor?: number | null;
 };
 
 export type SubtitleFile = {
@@ -95,6 +151,12 @@ export type SubtitleFile = {
 
 export type FilesResponse = {
   files: SubtitleFile[];
+  next_cursor?: number | null;
+};
+
+export type FileAnalysisResponse = {
+  analysis: NonNullable<SubtitleFile["analysis"]> | null;
+  cached?: boolean;
 };
 
 export type Backup = {
@@ -108,6 +170,7 @@ export type Backup = {
 
 export type BackupsResponse = {
   backups: Backup[];
+  next_cursor?: number | null;
 };
 
 export type EventPayload = {

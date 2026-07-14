@@ -56,9 +56,14 @@ pub struct Config {
     pub admin_password_hash: Option<String>,
     pub admin_password_plain: Option<String>,
     pub allow_no_auth: bool,
+    pub secure_cookies: bool,
     pub max_concurrent_jobs: usize,
     pub max_font_workers: usize,
     pub max_index_concurrency: usize,
+    pub max_scan_concurrency: usize,
+    pub max_conversion_memory_mb: usize,
+    pub subset_cache_max_mb: u64,
+    pub font_worker_timeout: Duration,
     pub job_queue_size: usize,
     pub scan_interval: Duration,
     pub backup_retention_days: u64,
@@ -82,9 +87,10 @@ impl Config {
         let admin_password_hash = env::var("ADMIN_PASSWORD_HASH").ok();
         let admin_password_plain = env::var("ADMIN_PASSWORD").ok();
         let allow_no_auth = env_bool("ASS_SUBSET_ALLOW_NO_AUTH", false);
+        let secure_cookies = env_bool("SECURE_COOKIES", false);
         if !allow_no_auth && admin_password_hash.is_none() && admin_password_plain.is_none() {
             bail!(
-                "set ADMIN_PASSWORD_HASH=sha256:<hex> or ADMIN_PASSWORD; use ASS_SUBSET_ALLOW_NO_AUTH=1 only for trusted local development"
+                "set ADMIN_PASSWORD_HASH to an Argon2id PHC string (legacy sha256:<hex> is supported) or set ADMIN_PASSWORD; use ASS_SUBSET_ALLOW_NO_AUTH=1 only for trusted local development"
             );
         }
 
@@ -92,8 +98,14 @@ impl Config {
         let max_font_workers = env_usize("MAX_FONT_WORKERS", 2).max(1);
         let max_index_concurrency =
             env_usize("MAX_INDEX_CONCURRENCY", (max_font_workers * 8).clamp(8, 64)).max(1);
+        let max_scan_concurrency = env_usize("MAX_SCAN_CONCURRENCY", 4).clamp(1, 32);
+        let max_conversion_memory_mb =
+            env_usize("MAX_CONVERSION_MEMORY_MB", 512).clamp(64, 32 * 1024);
+        let subset_cache_max_mb = env_u64("SUBSET_CACHE_MAX_MB", 2048).min(1024 * 1024);
+        let font_worker_timeout =
+            Duration::from_secs(env_u64("FONT_WORKER_TIMEOUT_SECONDS", 300).clamp(10, 3600));
         let job_queue_size = env_usize("JOB_QUEUE_SIZE", 1024).max(16);
-        let backup_retention_days = env_u64("BACKUP_RETENTION_DAYS", 0);
+        let backup_retention_days = env_u64("BACKUP_RETENTION_DAYS", 0).min(365_000);
         let scan_interval = parse_scan_interval();
 
         let mut options = ProcessingOptions::default();
@@ -121,9 +133,14 @@ impl Config {
             admin_password_hash,
             admin_password_plain,
             allow_no_auth,
+            secure_cookies,
             max_concurrent_jobs,
             max_font_workers,
             max_index_concurrency,
+            max_scan_concurrency,
+            max_conversion_memory_mb,
+            subset_cache_max_mb,
+            font_worker_timeout,
             job_queue_size,
             scan_interval,
             backup_retention_days,
@@ -139,8 +156,8 @@ impl Config {
         self.data_dir.join("cache").join("subsets")
     }
 
-    pub fn config_hash(&self) -> String {
-        self.options.config_hash()
+    pub fn subset_cache_max_bytes(&self) -> u64 {
+        self.subset_cache_max_mb.saturating_mul(1024 * 1024)
     }
 }
 
@@ -152,11 +169,18 @@ fn env_path(key: &str, default: &str) -> PathBuf {
 
 fn env_paths(key: &str, default: &str) -> Vec<PathBuf> {
     let raw = env::var(key).unwrap_or_else(|_| default.to_string());
-    raw.split([',', ';'])
+    let mut paths = Vec::new();
+    for value in raw
+        .split([',', ';'])
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .collect()
+    {
+        let path = PathBuf::from(value);
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    paths
 }
 
 fn env_bool(key: &str, default: bool) -> bool {
@@ -186,10 +210,10 @@ fn parse_scan_interval() -> Duration {
         if raw.eq_ignore_ascii_case("disabled") || raw == "0" {
             return Duration::from_secs(0);
         }
-        if let Some(rest) = raw.strip_prefix("@every ") {
-            if let Some(d) = parse_duration(rest.trim()) {
-                return d;
-            }
+        if let Some(rest) = raw.strip_prefix("@every ")
+            && let Some(d) = parse_duration(rest.trim())
+        {
+            return d;
         }
     }
     Duration::from_secs(env_u64("SCAN_INTERVAL_SECONDS", 3600))

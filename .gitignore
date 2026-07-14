@@ -9,6 +9,7 @@
 /FontLoaderSub-ref/
 /output/
 /.playwright-cli/
+/.codex-runtime/
 /web/node_modules/
 /web/dist/
 /web/*.tsbuildinfo

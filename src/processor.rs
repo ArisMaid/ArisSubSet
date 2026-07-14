@@ -1,17 +1,19 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use base64::{Engine, engine::general_purpose};
 use chrono::Utc;
 use filetime::{FileTime, set_file_mtime};
 use fs2::FileExt;
-use rand::{Rng, distributions::Uniform};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
-use tokio::sync::{Semaphore, mpsc};
+use tokio::io::AsyncReadExt;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
@@ -20,7 +22,10 @@ use crate::ass::{
     normalize_lookup_name, parse_embedded_fonts, parse_font_subset_comments, parse_subtitle,
     rewrite_drawings_as_font, rewrite_strip_embedded, rewrite_with_embedded_fonts,
 };
+use crate::backup;
+use crate::cache;
 use crate::config::ProcessingOptions;
+use crate::failure_log;
 use crate::font_worker::{DrawFontRequest, RandomizeMap, SubsetRequest};
 use crate::models::{EmbeddedFont, FontCandidate, FontSlot, JobMode};
 use crate::state::AppState;
@@ -52,6 +57,7 @@ pub fn spawn_controlled_job_loop(mut rx: mpsc::Receiver<i64>, state: Arc<AppStat
     tokio::spawn(async move {
         let mut pending = VecDeque::new();
         let mut active = JoinSet::new();
+        let memory = Arc::new(Semaphore::new(state.config.max_conversion_memory_mb));
         loop {
             tokio::select! {
                 received = rx.recv() => {
@@ -89,8 +95,14 @@ pub fn spawn_controlled_job_loop(mut rx: mpsc::Receiver<i64>, state: Arc<AppStat
                     continue;
                 }
                 let st = state.clone();
+                let memory = memory.clone();
                 active.spawn(async move {
-                    if let Err(err) = process_job(st.clone(), job_id).await {
+                    let result = async {
+                        let _memory_permit = acquire_job_memory(&st, job_id, memory).await?;
+                        process_job(st.clone(), job_id).await
+                    }
+                    .await;
+                    if let Err(err) = result {
                         if st.conversion_cancel_requested().await {
                             let _ = cancel_job(&st, job_id, "cancelled while running").await;
                         } else {
@@ -130,6 +142,36 @@ pub async fn recover_incomplete_jobs(state: Arc<AppState>) -> anyhow::Result<usi
     Ok(count)
 }
 
+async fn acquire_job_memory(
+    state: &Arc<AppState>,
+    job_id: i64,
+    memory: Arc<Semaphore>,
+) -> anyhow::Result<OwnedSemaphorePermit> {
+    let size: i64 = sqlx::query_scalar(
+        "SELECT sf.size FROM jobs j JOIN subtitle_files sf ON sf.id=j.subtitle_id WHERE j.id=?",
+    )
+    .bind(job_id)
+    .fetch_one(&state.db.pool)
+    .await?;
+    let permits = memory_permits_for_size(size, state.config.max_conversion_memory_mb);
+    memory
+        .acquire_many_owned(permits)
+        .await
+        .context("conversion memory limiter closed")
+}
+
+fn memory_permits_for_size(size: i64, max_memory_mb: usize) -> u32 {
+    const MIB: u64 = 1024 * 1024;
+    const WORKING_SET_MULTIPLIER: u64 = 5;
+    let estimated = (size.max(0) as u64).saturating_mul(WORKING_SET_MULTIPLIER);
+    estimated
+        .saturating_add(MIB - 1)
+        .checked_div(MIB)
+        .unwrap_or(1)
+        .max(1)
+        .min(max_memory_mb.max(1) as u64) as u32
+}
+
 #[derive(Debug, serde::Serialize)]
 struct ProcessStats {
     embedded_count: usize,
@@ -144,17 +186,28 @@ struct ProcessStats {
 }
 
 async fn process_job(state: Arc<AppState>, job_id: i64) -> anyhow::Result<()> {
-    let row = sqlx::query("SELECT subtitle_id, path, mode FROM jobs WHERE id = ?")
+    let row = sqlx::query("SELECT subtitle_id, path, mode, queued_at FROM jobs WHERE id = ?")
         .bind(job_id)
         .fetch_one(&state.db.pool)
         .await?;
     let subtitle_id: i64 = row.get("subtitle_id");
     let path: String = row.get("path");
     let mode = JobMode::from_db(&row.get::<String, _>("mode"));
-    match mode {
-        JobMode::Subset => process_subset_job(state, job_id, subtitle_id, path).await,
-        JobMode::StripEmbedded => process_strip_job(state, job_id, subtitle_id, path).await,
-    }
+    let queued_at: String = row.get("queued_at");
+    let queue_latency = chrono::DateTime::parse_from_rfc3339(&queued_at)
+        .ok()
+        .and_then(|queued| (Utc::now() - queued.with_timezone(&Utc)).to_std().ok())
+        .unwrap_or(Duration::ZERO);
+    state.metrics.record_conversion_started(queue_latency);
+    let started = Instant::now();
+    let result = match mode {
+        JobMode::Subset => process_subset_job(state.clone(), job_id, subtitle_id, path).await,
+        JobMode::StripEmbedded => process_strip_job(state.clone(), job_id, subtitle_id, path).await,
+    };
+    state
+        .metrics
+        .record_conversion_finished(started.elapsed(), result.is_ok());
+    result
 }
 
 async fn process_subset_job(
@@ -165,6 +218,7 @@ async fn process_subset_job(
 ) -> anyhow::Result<()> {
     let options = state.processing_options().await;
     let config_hash = options.config_hash();
+    let font_index_revision = state.font_index_revision().await;
     let path_buf = PathBuf::from(&path);
     let started = Utc::now().to_rfc3339();
     sqlx::query("UPDATE jobs SET status='running', started_at=?, message=NULL WHERE id=?")
@@ -179,7 +233,7 @@ async fn process_subset_job(
     if state.conversion_cancel_requested().await {
         bail!("cancelled");
     }
-    let bytes = read_locked(&path_buf)?;
+    let bytes = read_locked(&path_buf).await?;
     let original_size = bytes.len() as u64;
     let decoded = decode_subtitle(&bytes)?;
     let parsed = parse_subtitle(&decoded.text);
@@ -188,6 +242,7 @@ async fn process_subset_job(
     let mut rename_map = HashMap::new();
     let mut missing_fonts = Vec::new();
     let mut used_random_names = HashSet::new();
+    let mut assigned_random_names: HashMap<String, String> = HashMap::new();
 
     for (font_name, usage) in parsed.usages.iter() {
         if state.conversion_cancel_requested().await {
@@ -210,7 +265,13 @@ async fn process_subset_job(
             continue;
         }
         let embedded_name = if options.randomize_font_names {
-            random_font_name(&mut used_random_names)
+            if let Some(name) = assigned_random_names.get(&normalized) {
+                name.clone()
+            } else {
+                let name = stable_font_name(&normalized, &mut used_random_names);
+                assigned_random_names.insert(normalized.clone(), name.clone());
+                name
+            }
         } else {
             font_name.clone()
         };
@@ -220,7 +281,6 @@ async fn process_subset_job(
         subset_usage(
             &state,
             &options,
-            &config_hash,
             font_name,
             &embedded_name,
             usage,
@@ -244,29 +304,29 @@ async fn process_subset_job(
     };
 
     let mut wrote_file = false;
-    let final_bytes = if embedded.is_empty() {
-        bytes.clone()
+    let final_bytes: Cow<'_, [u8]> = if embedded.is_empty() {
+        Cow::Borrowed(&bytes)
     } else {
         let rewritten =
             rewrite_with_embedded_fonts(&base_text, &parsed.newline, &rename_map, &embedded);
         wrote_file = rewritten != decoded.text;
-        encode_subtitle(&rewritten, &decoded.bom)
+        Cow::Owned(encode_subtitle(&rewritten, &decoded.bom))
     };
 
     if wrote_file {
         let source_sha = sha256_hex(&bytes);
-        let backup_path = backup_original(&state, subtitle_id, &path_buf, &source_sha).await?;
+        let backup_path = backup::create(&state, subtitle_id, &path_buf, &source_sha).await?;
         state.events.emit(
             "backup",
             "ok",
             format!("已创建备份：{}", backup_path.display()),
         );
-        write_replace(&path_buf, &final_bytes).await?;
+        write_replace(&path_buf, final_bytes.as_ref()).await?;
     }
 
+    let new_sha = sha256_hex(final_bytes.as_ref());
     touch_processed_file(&path_buf).await?;
     let new_meta = tokio::fs::metadata(&path_buf).await?;
-    let new_sha = sha256_file(&path_buf).await?;
     let status = if missing_fonts.is_empty() {
         "success"
     } else {
@@ -311,7 +371,7 @@ async fn process_subset_job(
         r#"
 UPDATE subtitle_files
 SET size=?, mtime=?, sha256=?, last_config_hash=?, last_status=?, last_processed_at=?,
-    missing_fonts=?, error=NULL
+    missing_fonts=?, error=NULL, last_font_index_revision=?
 WHERE id=?
 "#,
     )
@@ -329,6 +389,7 @@ WHERE id=?
     .bind(status)
     .bind(&finished)
     .bind(&missing_json)
+    .bind(font_index_revision as i64)
     .bind(subtitle_id)
     .execute(&state.db.pool)
     .await?;
@@ -343,6 +404,7 @@ async fn process_strip_job(
     path: String,
 ) -> anyhow::Result<()> {
     let config_hash = state.config_hash().await;
+    let font_index_revision = state.font_index_revision().await;
     let path_buf = PathBuf::from(&path);
     let started = Utc::now().to_rfc3339();
     sqlx::query("UPDATE jobs SET status='running', started_at=?, message=NULL WHERE id=?")
@@ -357,7 +419,7 @@ async fn process_strip_job(
     if state.conversion_cancel_requested().await {
         bail!("cancelled");
     }
-    let bytes = read_locked(&path_buf)?;
+    let bytes = read_locked(&path_buf).await?;
     let original_size = bytes.len() as u64;
     let decoded = decode_subtitle(&bytes)?;
     let parsed = parse_subtitle(&decoded.text);
@@ -420,21 +482,25 @@ async fn process_strip_job(
         &draw_map,
     );
     let wrote_file = rewritten != decoded.text;
-    let final_bytes = encode_subtitle(&rewritten, &decoded.bom);
+    let final_bytes: Cow<'_, [u8]> = if wrote_file {
+        Cow::Owned(encode_subtitle(&rewritten, &decoded.bom))
+    } else {
+        Cow::Borrowed(&bytes)
+    };
     if wrote_file {
         let source_sha = sha256_hex(&bytes);
-        let backup_path = backup_original(&state, subtitle_id, &path_buf, &source_sha).await?;
+        let backup_path = backup::create(&state, subtitle_id, &path_buf, &source_sha).await?;
         state.events.emit(
             "backup",
             "ok",
             format!("已创建备份：{}", backup_path.display()),
         );
-        write_replace(&path_buf, &final_bytes).await?;
+        write_replace(&path_buf, final_bytes.as_ref()).await?;
     }
 
+    let new_sha = sha256_hex(final_bytes.as_ref());
     touch_processed_file(&path_buf).await?;
     let new_meta = tokio::fs::metadata(&path_buf).await?;
-    let new_sha = sha256_file(&path_buf).await?;
     let status = if warnings.is_empty() {
         "success"
     } else {
@@ -480,7 +546,7 @@ async fn process_strip_job(
         r#"
 UPDATE subtitle_files
 SET size=?, mtime=?, sha256=?, last_config_hash=?, last_status=?, last_processed_at=?,
-    missing_fonts=?, error=NULL
+    missing_fonts=?, error=NULL, last_font_index_revision=?
 WHERE id=?
 "#,
     )
@@ -498,6 +564,7 @@ WHERE id=?
     .bind(status)
     .bind(&finished)
     .bind(&warnings_json)
+    .bind(font_index_revision as i64)
     .bind(subtitle_id)
     .execute(&state.db.pool)
     .await?;
@@ -508,7 +575,6 @@ WHERE id=?
 async fn subset_usage(
     state: &Arc<AppState>,
     options: &ProcessingOptions,
-    config_hash: &str,
     original_name: &str,
     embedded_name: &str,
     usage: &FontUsage,
@@ -532,7 +598,6 @@ async fn subset_usage(
             let font = subset_candidate(
                 state,
                 options,
-                config_hash,
                 original_name,
                 embedded_name,
                 slot,
@@ -553,7 +618,6 @@ async fn subset_usage(
         let font = subset_candidate(
             state,
             options,
-            config_hash,
             original_name,
             embedded_name,
             FontSlot::Normal,
@@ -575,9 +639,15 @@ async fn create_draw_font(
         .config
         .subset_cache_dir()
         .join(format!("{cache_key}.draw.ttf"));
-    if !output_path.exists() {
+    let cache_lock = state.cache_lock(&format!("draw:{cache_key}")).await;
+    let _cache_guard = cache_lock.lock().await;
+    let cache_hit = cache::file_is_ready(&output_path).await;
+    state.metrics.record_cache_lookup(cache_hit);
+    if !cache_hit {
         tokio::fs::create_dir_all(state.config.subset_cache_dir()).await?;
-        let output_path_s = output_path.to_string_lossy().to_string();
+        cache::remove_file_if_exists(&output_path).await?;
+        let temp_path = cache::temp_path(&output_path);
+        let output_path_s = temp_path.to_string_lossy().to_string();
         let worker_entries: Vec<crate::font_worker::DrawTableEntry> = entries
             .iter()
             .map(|entry| crate::font_worker::DrawTableEntry {
@@ -590,10 +660,22 @@ async fn create_draw_font(
             output_path: &output_path_s,
             family: "ASSDrawSubset",
             drawings: &worker_entries,
+            service_version: env!("CARGO_PKG_VERSION"),
         };
-        state.workers.create_draw_font(&req).await?;
+        if let Err(error) = state.workers.create_draw_font(&req).await {
+            let _ = cache::remove_file_if_exists(&temp_path).await;
+            return Err(error);
+        }
+        if !cache::file_is_ready(&temp_path).await {
+            let _ = cache::remove_file_if_exists(&temp_path).await;
+            bail!(
+                "draw font worker did not create a valid cache file {}",
+                temp_path.display()
+            );
+        }
+        cache::publish(state, &temp_path, &output_path).await?;
     }
-    let data = tokio::fs::read(&output_path).await.with_context(|| {
+    let data = cache::read_and_touch(&output_path).await.with_context(|| {
         format!(
             "draw font worker did not create expected cache file {}",
             output_path.display()
@@ -603,15 +685,13 @@ async fn create_draw_font(
         original_name: "ASSDrawSubset".to_string(),
         embedded_name: "ASSDrawSubset".to_string(),
         slot: FontSlot::Normal,
-        orig_size: 0,
-        subset_size: data.len() as u64,
         data,
     })
 }
 
 fn draw_cache_key(entries: &[DrawRestoreEntry]) -> String {
     let mut h = Sha256::new();
-    h.update(b"draw-v2.7");
+    h.update(b"draw-cache-v3");
     for entry in entries {
         h.update(entry.data.as_bytes());
         h.update(entry.ch.as_bytes());
@@ -623,7 +703,6 @@ fn draw_cache_key(entries: &[DrawRestoreEntry]) -> String {
 async fn subset_candidate(
     state: &Arc<AppState>,
     options: &ProcessingOptions,
-    config_hash: &str,
     original_name: &str,
     embedded_name: &str,
     slot: FontSlot,
@@ -637,14 +716,19 @@ async fn subset_candidate(
         codepoints,
         candidate,
         &font_hash,
-        config_hash,
+        options,
     );
     let output_path = state
         .config
         .subset_cache_dir()
         .join(format!("{cache_key}.ttf"));
-    if !output_path.exists() {
+    let cache_lock = state.cache_lock(&format!("font:{cache_key}")).await;
+    let _cache_guard = cache_lock.lock().await;
+    let cache_hit = cache::file_is_ready(&output_path).await;
+    state.metrics.record_cache_lookup(cache_hit);
+    if !cache_hit {
         tokio::fs::create_dir_all(state.config.subset_cache_dir()).await?;
+        cache::remove_file_if_exists(&output_path).await?;
         let subfamily = match slot {
             FontSlot::Normal => "Regular",
             FontSlot::Bold => "Bold",
@@ -659,7 +743,8 @@ async fn subset_candidate(
         } else {
             None
         };
-        let output_path_s = output_path.to_string_lossy().to_string();
+        let temp_path = cache::temp_path(&output_path);
+        let output_path_s = temp_path.to_string_lossy().to_string();
         let req = SubsetRequest {
             source_path: &candidate.path,
             ttc_index: candidate.ttc_index,
@@ -667,36 +752,58 @@ async fn subset_candidate(
             codepoints,
             include_ascii: options.include_ascii,
             full_font: options.full_font_embed,
+            retain_variations: options.variable_fonts,
             target_family: embedded_name,
             original_family: original_name,
             subfamily,
             randomize_map,
+            service_version: env!("CARGO_PKG_VERSION"),
         };
-        if let Err(err) = state.workers.subset_font(&req).await {
+        let generation_result = if let Err(err) = state.workers.subset_font(&req).await {
             if options.full_font_embed || !options.fallback_full_font_embed {
-                return Err(err);
+                Err(err)
+            } else {
+                let fallback_req = SubsetRequest {
+                    source_path: &candidate.path,
+                    ttc_index: candidate.ttc_index,
+                    output_path: &output_path_s,
+                    codepoints,
+                    include_ascii: options.include_ascii,
+                    full_font: true,
+                    retain_variations: options.variable_fonts,
+                    target_family: embedded_name,
+                    original_family: original_name,
+                    subfamily,
+                    randomize_map,
+                    service_version: env!("CARGO_PKG_VERSION"),
+                };
+                state.events.emit(
+                    "job",
+                    "warn",
+                    format!("subset failed, retrying full embed for {original_name}: {err:#}"),
+                );
+                state.workers.subset_font(&fallback_req).await.map(|_| ())
             }
-            let fallback_req = SubsetRequest {
-                source_path: &candidate.path,
-                ttc_index: candidate.ttc_index,
-                output_path: &output_path_s,
-                codepoints,
-                include_ascii: options.include_ascii,
-                full_font: true,
-                target_family: embedded_name,
-                original_family: original_name,
-                subfamily,
-                randomize_map,
-            };
-            state.events.emit(
-                "job",
-                "warn",
-                format!("subset failed, retrying full embed for {original_name}: {err:#}"),
+        } else {
+            Ok(())
+        };
+        if let Err(error) = generation_result {
+            let _ = cache::remove_file_if_exists(&temp_path).await;
+            return Err(error);
+        }
+        if !cache::file_is_ready(&temp_path).await {
+            let _ = cache::remove_file_if_exists(&temp_path).await;
+            bail!(
+                "subset worker did not create a valid cache file {}",
+                temp_path.display()
             );
-            state.workers.subset_font(&fallback_req).await?;
+        }
+        if let Err(error) = cache::publish(state, &temp_path, &output_path).await {
+            let _ = cache::remove_file_if_exists(&temp_path).await;
+            return Err(error);
         }
     }
-    let data = tokio::fs::read(&output_path).await.with_context(|| {
+    let data = cache::read_and_touch(&output_path).await.with_context(|| {
         format!(
             "subset worker did not create expected cache file {}",
             output_path.display()
@@ -706,11 +813,6 @@ async fn subset_candidate(
         original_name: original_name.to_string(),
         embedded_name: embedded_name.to_string(),
         slot,
-        orig_size: tokio::fs::metadata(&candidate.path)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0),
-        subset_size: data.len() as u64,
         data,
     })
 }
@@ -721,13 +823,17 @@ fn subset_cache_key(
     codepoints: &[u32],
     candidate: &FontCandidate,
     font_hash: &str,
-    config_hash: &str,
+    options: &ProcessingOptions,
 ) -> String {
     let mut h = Sha256::new();
+    h.update(b"font-cache-v3");
     h.update(font_hash.as_bytes());
     h.update(candidate.ttc_index.to_le_bytes());
     h.update(slot.as_str().as_bytes());
-    h.update(config_hash.as_bytes());
+    h.update([options.include_ascii as u8]);
+    h.update([options.full_font_embed as u8]);
+    h.update([options.fallback_full_font_embed as u8]);
+    h.update([options.variable_fonts as u8]);
     h.update(embedded_name.as_bytes());
     for cp in codepoints {
         h.update(cp.to_le_bytes());
@@ -757,8 +863,20 @@ async fn ensure_candidate_full_hash(
     if !candidate.full_hash.trim().is_empty() {
         return Ok(candidate.full_hash.clone());
     }
+    let cache_lock = state
+        .cache_lock(&format!("font-hash:{}", candidate.file_id))
+        .await;
+    let _cache_guard = cache_lock.lock().await;
+    let existing: Option<String> =
+        sqlx::query_scalar("SELECT full_hash FROM font_files WHERE id = ?")
+            .bind(candidate.file_id)
+            .fetch_optional(&state.db.pool)
+            .await?;
+    if let Some(existing) = existing.filter(|hash| !hash.trim().is_empty()) {
+        return Ok(existing);
+    }
     let hash = sha256_file(Path::new(&candidate.path)).await?;
-    sqlx::query("UPDATE font_files SET full_hash = ? WHERE id = ?")
+    sqlx::query("UPDATE font_files SET full_hash = ? WHERE id = ? AND full_hash = ''")
         .bind(&hash)
         .bind(candidate.file_id)
         .execute(&state.db.pool)
@@ -775,12 +893,9 @@ async fn query_candidates(
         r#"
 SELECT DISTINCT
   f.id AS file_id,
-  ff.id AS face_id,
   f.path AS path,
   f.full_hash AS full_hash,
   ff.ttc_index AS ttc_index,
-  COALESCE(ff.family, n.name) AS family,
-  COALESCE(ff.subfamily, '') AS subfamily,
   ff.weight AS weight,
   ff.italic AS italic
 FROM font_names n
@@ -796,12 +911,9 @@ WHERE n.normalized = ? AND f.status = 'ok'
         .into_iter()
         .map(|row| FontCandidate {
             file_id: row.get("file_id"),
-            face_id: row.get("face_id"),
             path: row.get("path"),
             full_hash: row.get("full_hash"),
             ttc_index: row.get("ttc_index"),
-            family: row.get("family"),
-            subfamily: row.get("subfamily"),
             weight: row.get("weight"),
             italic: row.get::<i64, _>("italic") != 0,
         })
@@ -815,45 +927,6 @@ fn select_best_candidate(candidates: &[FontCandidate], slot: FontSlot) -> Option
         let italic_score = if c.italic == target_italic { 0 } else { 10_000 };
         italic_score + weight_score
     })
-}
-
-async fn backup_original(
-    state: &Arc<AppState>,
-    subtitle_id: i64,
-    source: &Path,
-    source_sha: &str,
-) -> anyhow::Result<PathBuf> {
-    let row = sqlx::query("SELECT root_label, relative_path FROM subtitle_files WHERE id = ?")
-        .bind(subtitle_id)
-        .fetch_one(&state.db.pool)
-        .await?;
-    let root_label: String = row.get("root_label");
-    let relative_path: String = row.get("relative_path");
-    let rel = Path::new(&relative_path);
-    let parent = rel.parent().unwrap_or_else(|| Path::new(""));
-    let stem = rel
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("subtitle");
-    let ext = rel.extension().and_then(|s| s.to_str()).unwrap_or("ass");
-    let ts = Utc::now().format("%Y%m%d-%H%M%S").to_string();
-    let sha8 = &source_sha[..source_sha.len().min(8)];
-    let backup_name = format!("{stem}.{ts}.{sha8}.{ext}");
-    let backup_dir = state.config.backup_dir.join(root_label).join(parent);
-    tokio::fs::create_dir_all(&backup_dir).await?;
-    let backup_path = backup_dir.join(backup_name);
-    tokio::fs::copy(source, &backup_path).await?;
-    sqlx::query(
-        "INSERT INTO backups(subtitle_id, source_path, backup_path, source_sha256, created_at) VALUES(?, ?, ?, ?, ?)",
-    )
-    .bind(subtitle_id)
-    .bind(source.to_string_lossy().to_string())
-    .bind(backup_path.to_string_lossy().to_string())
-    .bind(source_sha)
-    .bind(Utc::now().to_rfc3339())
-    .execute(&state.db.pool)
-    .await?;
-    Ok(backup_path)
 }
 
 async fn write_replace(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
@@ -888,7 +961,14 @@ async fn touch_processed_file(path: &Path) -> anyhow::Result<()> {
     .context("touch processed subtitle task failed")?
 }
 
-fn read_locked(path: &Path) -> anyhow::Result<Vec<u8>> {
+async fn read_locked(path: &Path) -> anyhow::Result<Vec<u8>> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || read_locked_sync(&path))
+        .await
+        .context("read locked subtitle task failed")?
+}
+
+fn read_locked_sync(path: &Path) -> anyhow::Result<Vec<u8>> {
     let mut file = std::fs::OpenOptions::new()
         .read(true)
         .open(path)
@@ -897,7 +977,7 @@ fn read_locked(path: &Path) -> anyhow::Result<Vec<u8>> {
         .with_context(|| format!("lock subtitle {}", path.display()))?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
-    file.unlock()?;
+    FileExt::unlock(&file)?;
     Ok(bytes)
 }
 
@@ -909,17 +989,34 @@ async fn fail_job(state: &Arc<AppState>, job_id: i64, error: &str) -> anyhow::Re
         .bind(job_id)
         .execute(&state.db.pool)
         .await?;
-    if let Some(row) = sqlx::query("SELECT subtitle_id FROM jobs WHERE id=?")
+    if let Some(row) = sqlx::query("SELECT subtitle_id, path, mode FROM jobs WHERE id=?")
         .bind(job_id)
         .fetch_optional(&state.db.pool)
         .await?
     {
         let subtitle_id: i64 = row.get("subtitle_id");
+        let path: String = row.get("path");
+        let mode: String = row.get("mode");
         sqlx::query("UPDATE subtitle_files SET last_status='failed', error=? WHERE id=?")
             .bind(error)
             .bind(subtitle_id)
             .execute(&state.db.pool)
             .await?;
+        if let Err(err) = failure_log::append(
+            state,
+            job_id,
+            Some(subtitle_id),
+            &path,
+            &mode,
+            error,
+            &finished,
+        )
+        .await
+        {
+            state
+                .events
+                .emit("job", "warn", format!("failed to write error log: {err:#}"));
+        }
     }
     Ok(())
 }
@@ -954,16 +1051,19 @@ async fn job_is_runnable(state: &Arc<AppState>, job_id: i64) -> anyhow::Result<b
     Ok(matches!(status.as_deref(), Some("queued")))
 }
 
-fn random_font_name(used: &mut HashSet<String>) -> String {
-    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    let dist = Uniform::from(0..CHARS.len());
-    let mut rng = rand::thread_rng();
-    loop {
-        let name: String = (0..8).map(|_| CHARS[rng.sample(dist)] as char).collect();
+fn stable_font_name(normalized_name: &str, used: &mut HashSet<String>) -> String {
+    for salt in 0u32.. {
+        let mut hash = Sha256::new();
+        hash.update(b"stable-font-name-v1");
+        hash.update(normalized_name.as_bytes());
+        hash.update(salt.to_le_bytes());
+        let digest = hex::encode_upper(hash.finalize());
+        let name = format!("AS{}", &digest[..10]);
         if used.insert(name.clone()) {
             return name;
         }
     }
+    unreachable!("32-bit stable font name salt space exhausted")
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -973,27 +1073,95 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 async fn sha256_file(path: &Path) -> anyhow::Result<String> {
-    let bytes = tokio::fs::read(path)
+    let mut file = tokio::fs::File::open(path)
         .await
-        .with_context(|| format!("read {}", path.display()))?;
-    Ok(sha256_hex(&bytes))
+        .with_context(|| format!("open {}", path.display()))?;
+    let mut hash = Sha256::new();
+    let mut buffer = vec![0u8; 256 * 1024];
+    loop {
+        let n = file.read(&mut buffer).await?;
+        if n == 0 {
+            break;
+        }
+        hash.update(&buffer[..n]);
+    }
+    Ok(hex::encode(hash.finalize()))
 }
 
-pub async fn restore_backup(state: &Arc<AppState>, backup_id: i64) -> anyhow::Result<()> {
-    let row = sqlx::query("SELECT source_path, backup_path FROM backups WHERE id = ?")
-        .bind(backup_id)
-        .fetch_one(&state.db.pool)
-        .await?;
-    let source_path: String = row.get("source_path");
-    let backup_path: String = row.get("backup_path");
-    if !Path::new(&backup_path).exists() {
-        bail!("backup file is missing: {backup_path}");
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn candidate() -> FontCandidate {
+        FontCandidate {
+            file_id: 1,
+            path: "font.ttf".to_string(),
+            full_hash: "abc".to_string(),
+            ttc_index: -1,
+            weight: 400,
+            italic: false,
+        }
     }
-    tokio::fs::copy(&backup_path, &source_path).await?;
-    state.events.emit(
-        "backup",
-        "ok",
-        format!("已恢复备份：{source_path} <- {backup_path}"),
-    );
-    Ok(())
+
+    #[test]
+    fn memory_budget_rounds_up_and_caps_large_subtitles() {
+        assert_eq!(memory_permits_for_size(0, 512), 1);
+        assert_eq!(memory_permits_for_size(1024 * 1024, 512), 5);
+        assert_eq!(memory_permits_for_size(200 * 1024 * 1024, 512), 512);
+        assert_eq!(memory_permits_for_size(-1, 512), 1);
+    }
+
+    #[test]
+    fn stable_names_are_repeatable_and_collision_safe() {
+        let first = stable_font_name("example font", &mut HashSet::new());
+        let second = stable_font_name("example font", &mut HashSet::new());
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 12);
+
+        let mut used = HashSet::from([first.clone()]);
+        assert_ne!(stable_font_name("example font", &mut used), first);
+    }
+
+    #[test]
+    fn cache_key_ignores_non_font_processing_switches() {
+        let base = ProcessingOptions::default();
+        let key = subset_cache_key(
+            "AS1234567890",
+            FontSlot::Normal,
+            &[65, 66],
+            &candidate(),
+            "font-hash",
+            &base,
+        );
+        let mut changed = base.clone();
+        changed.embed_external_fonts = !changed.embed_external_fonts;
+        changed.embed_system_fonts = !changed.embed_system_fonts;
+        changed.multi_weight = !changed.multi_weight;
+        changed.randomize_font_names = !changed.randomize_font_names;
+        changed.draw_subset = !changed.draw_subset;
+        assert_eq!(
+            key,
+            subset_cache_key(
+                "AS1234567890",
+                FontSlot::Normal,
+                &[65, 66],
+                &candidate(),
+                "font-hash",
+                &changed,
+            )
+        );
+
+        changed.include_ascii = !changed.include_ascii;
+        assert_ne!(
+            key,
+            subset_cache_key(
+                "AS1234567890",
+                FontSlot::Normal,
+                &[65, 66],
+                &candidate(),
+                "font-hash",
+                &changed,
+            )
+        );
+    }
 }

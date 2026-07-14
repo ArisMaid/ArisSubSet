@@ -40,13 +40,13 @@ fn inspect_font_sync(path: PathBuf) -> anyhow::Result<Vec<FontFaceInfo>> {
 
     let mut faces = Vec::new();
     if &head[0..4] == b"ttcf" {
-        let count = be_u32(&head, 8)? as usize;
+        let count = be_u32(head, 8)? as usize;
         if count == 0 || count > 4096 {
             bail!("invalid TTC face count: {count}");
         }
         let offsets_buf = slice_at(data, 12, count * 4)?;
         for i in 0..count {
-            let offset = be_u32(&offsets_buf, i * 4)? as usize;
+            let offset = be_u32(offsets_buf, i * 4)? as usize;
             faces.push(parse_face(data, offset, i as i32)?);
         }
     } else {
@@ -65,7 +65,7 @@ fn parse_face(data: &[u8], base: usize, ttc_index: i32) -> anyhow::Result<FontFa
     if sfnt != b"OTTO" && sfnt != b"true" && sfnt != b"typ1" && sfnt != [0, 1, 0, 0] {
         bail!("unrecognized sfnt version");
     }
-    let num_tables = be_u16(&head, 4)? as usize;
+    let num_tables = be_u16(head, 4)? as usize;
     if num_tables == 0 || num_tables > 4096 {
         bail!("invalid sfnt table count: {num_tables}");
     }
@@ -77,8 +77,8 @@ fn parse_face(data: &[u8], base: usize, ttc_index: i32) -> anyhow::Result<FontFa
         let off = i * 16;
         let tag = &dir[off..off + 4];
         let record = TableRecord {
-            offset: be_u32(&dir, off + 8)? as usize,
-            length: be_u32(&dir, off + 12)? as usize,
+            offset: be_u32(dir, off + 8)? as usize,
+            length: be_u32(dir, off + 12)? as usize,
         };
         match tag {
             b"name" => name = Some(record),
@@ -143,16 +143,16 @@ fn parse_face(data: &[u8], base: usize, ttc_index: i32) -> anyhow::Result<FontFa
 
 fn parse_name_table(data: &[u8], record: TableRecord) -> anyhow::Result<Vec<NameRecord>> {
     let len = record.length;
-    if len < 6 || len > 16 * 1024 * 1024 {
+    if !(6..=16 * 1024 * 1024).contains(&len) {
         bail!("invalid name table length: {len}");
     }
     let buf = slice_at(data, record.offset, len)?;
-    let format = be_u16(&buf, 0)?;
+    let format = be_u16(buf, 0)?;
     if format > 1 {
         bail!("unsupported name table format: {format}");
     }
-    let count = be_u16(&buf, 2)? as usize;
-    let string_offset = be_u16(&buf, 4)? as usize;
+    let count = be_u16(buf, 2)? as usize;
+    let string_offset = be_u16(buf, 4)? as usize;
     if 6 + count * 12 > buf.len() || string_offset > buf.len() {
         bail!("corrupt name table");
     }
@@ -160,18 +160,18 @@ fn parse_name_table(data: &[u8], record: TableRecord) -> anyhow::Result<Vec<Name
     let mut out = Vec::new();
     for i in 0..count {
         let off = 6 + i * 12;
-        let platform_id = be_u16(&buf, off)?;
-        let encoding_id = be_u16(&buf, off + 2)?;
-        let lang_id = be_u16(&buf, off + 4)?;
-        let name_id = be_u16(&buf, off + 6)?;
+        let platform_id = be_u16(buf, off)?;
+        let encoding_id = be_u16(buf, off + 2)?;
+        let lang_id = be_u16(buf, off + 4)?;
+        let name_id = be_u16(buf, off + 6)?;
         if !matches!(platform_id, 0 | 3) {
             continue;
         }
         if !NAME_IDS.contains(&name_id) {
             continue;
         }
-        let length = be_u16(&buf, off + 8)? as usize;
-        let string_rel = be_u16(&buf, off + 10)? as usize;
+        let length = be_u16(buf, off + 8)? as usize;
+        let string_rel = be_u16(buf, off + 10)? as usize;
         let start = string_offset.saturating_add(string_rel);
         let end = start.saturating_add(length);
         if start > buf.len() || end > buf.len() || start > end {
@@ -196,7 +196,7 @@ fn parse_name_table(data: &[u8], record: TableRecord) -> anyhow::Result<Vec<Name
 
 fn decode_name(platform_id: u16, _encoding_id: u16, bytes: &[u8]) -> Option<String> {
     if platform_id == 0 || platform_id == 3 {
-        if bytes.len() % 2 != 0 {
+        if !bytes.len().is_multiple_of(2) {
             return None;
         }
         let words: Vec<u16> = bytes

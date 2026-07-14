@@ -1,4 +1,5 @@
 :root {
+  overflow-x: clip;
   color: #17201b;
   background: #eef4ef;
   font-family:
@@ -14,6 +15,7 @@
 }
 
 body {
+  overflow-x: clip;
   min-width: 320px;
   min-height: 100vh;
   margin: 0;
@@ -468,6 +470,79 @@ h2 {
   color: #64736c;
 }
 
+.scan-progress {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 10px 2px;
+  border-top: 1px solid rgba(28, 58, 45, 0.1);
+  border-bottom: 1px solid rgba(28, 58, 45, 0.1);
+}
+
+.scan-progress > div:first-child {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.scan-progress > div:first-child span {
+  color: #64736c;
+  font-variant-numeric: tabular-nums;
+}
+
+.progress-track {
+  position: relative;
+  height: 5px;
+  overflow: hidden;
+  border-radius: 3px;
+  background: rgba(46, 111, 88, 0.12);
+}
+
+.progress-track i {
+  position: absolute;
+  inset: 0 auto 0 0;
+  min-width: 2px;
+  border-radius: inherit;
+  background: #2e6f58;
+  transition: width 180ms ease;
+}
+
+.progress-track[data-indeterminate="true"] i {
+  animation: scan-progress-run 1.4s ease-in-out infinite;
+}
+
+@keyframes scan-progress-run {
+  0% { left: -28%; }
+  100% { left: 100%; }
+}
+
+.scan-progress dl {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 8px;
+  margin: 0;
+}
+
+.scan-progress dl div {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 5px;
+}
+
+.scan-progress dt {
+  color: #64736c;
+  font-size: 0.78rem;
+}
+
+.scan-progress dd {
+  margin: 0;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+}
+
 .schedule-card {
   display: grid;
   grid-template-columns: 1fr;
@@ -762,6 +837,10 @@ th {
   font-weight: 800;
 }
 
+tbody tr[data-selected="true"] {
+  background: rgba(31, 122, 77, 0.08);
+}
+
 td code {
   display: block;
   max-width: 520px;
@@ -845,6 +924,12 @@ tr:last-child td {
   align-items: center;
   gap: 8px;
   margin-top: 14px;
+}
+
+.page-actions {
+  display: flex;
+  justify-content: center;
+  margin-top: 10px;
 }
 
 .event-log {
@@ -997,6 +1082,10 @@ tr:last-child td {
     grid-template-columns: 1fr;
   }
 
+  .scan-progress dl {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
   .drop-zone {
     grid-template-columns: 1fr;
   }
@@ -1030,10 +1119,17 @@ tr:last-child td {
   .action-strip,
   .row-actions,
   .inline-form,
-  .upload-box,
-  .schedule-presets {
+  .upload-box {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .schedule-presets {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .scan-progress dl {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .inline-form input,

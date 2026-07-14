@@ -4,7 +4,7 @@
 # 首次部署：
 #   1. 准备目录：./Fonts、./watch、./backups、./data
 #   2. 生成密码哈希：
-#      python -c "import hashlib,getpass; print('sha256:' + hashlib.sha256(getpass.getpass().encode()).hexdigest())"
+#      python -c "from argon2 import PasswordHasher; import getpass; print(PasswordHasher().hash(getpass.getpass()))"
 #   3. 将 ADMIN_PASSWORD_HASH 替换为生成值。
 #   4. docker compose up -d --build
 
@@ -24,7 +24,8 @@ services:
 
     environment:
       # 必填：管理员密码哈希。仅在完全可信的本地调试环境才使用 ASS_SUBSET_ALLOW_NO_AUTH=1。
-      ADMIN_PASSWORD_HASH: "${ADMIN_PASSWORD_HASH:-sha256:REPLACE_WITH_SHA256_HEX}"
+      ADMIN_PASSWORD_HASH: "${ADMIN_PASSWORD_HASH:-REPLACE_WITH_ARGON2ID_PHC_STRING}"
+      SECURE_COOKIES: "${SECURE_COOKIES:-false}"
 
       # 容器内固定目录；主机路径在 volumes 中配置。
       FONT_DIRS: "/fonts"
@@ -40,6 +41,11 @@ services:
       MAX_CONCURRENT_JOBS: "${MAX_CONCURRENT_JOBS:-1}"
       MAX_FONT_WORKERS: "${MAX_FONT_WORKERS:-2}"
       MAX_INDEX_CONCURRENCY: "${MAX_INDEX_CONCURRENCY:-16}"
+      MAX_SCAN_CONCURRENCY: "${MAX_SCAN_CONCURRENCY:-4}"
+      MAX_CONVERSION_MEMORY_MB: "${MAX_CONVERSION_MEMORY_MB:-512}"
+      # 子集缓存超过配额后按最近使用时间淘汰；0 表示不限制。
+      SUBSET_CACHE_MAX_MB: "${SUBSET_CACHE_MAX_MB:-2048}"
+      FONT_WORKER_TIMEOUT_SECONDS: "${FONT_WORKER_TIMEOUT_SECONDS:-300}"
       JOB_QUEUE_SIZE: "${JOB_QUEUE_SIZE:-256}"
 
       # 默认不自动删除备份；需要保留策略时再显式设置天数。
@@ -53,6 +59,7 @@ services:
       RANDOMIZE_FONT_NAMES: "${RANDOMIZE_FONT_NAMES:-true}"
       DRAW_SUBSET: "${DRAW_SUBSET:-true}"
       FULL_FONT_EMBED: "${FULL_FONT_EMBED:-false}"
+      FALLBACK_FULL_FONT_EMBED: "${FALLBACK_FULL_FONT_EMBED:-true}"
       VARIABLE_FONTS: "${VARIABLE_FONTS:-false}"
 
     volumes:
@@ -71,7 +78,7 @@ services:
           "CMD",
           "python",
           "-c",
-          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/status', timeout=5).read()",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=5).read()",
         ]
       interval: 30s
       timeout: 8s

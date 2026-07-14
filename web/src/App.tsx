@@ -1,4 +1,4 @@
-import { ChangeEvent, FormEvent, ReactNode, useEffect, useMemo, useState } from "react";
+import { ChangeEvent, FormEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArchiveRestore,
   Clock3,
@@ -6,6 +6,7 @@ import {
   ChevronDown,
   Database,
   Download,
+  Eye,
   FileText,
   Filter,
   FolderPlus,
@@ -28,6 +29,7 @@ import type {
   Backup,
   BackupsResponse,
   EventPayload,
+  FileAnalysisResponse,
   FilesResponse,
   Job,
   JobsResponse,
@@ -93,10 +95,24 @@ export default function App() {
   const [watchDir, setWatchDir] = useState("");
   const [uploadFile, setUploadFile] = useState<File | null>(null);
   const [scheduleMinutes, setScheduleMinutes] = useState("0");
+  const [selectedFileId, setSelectedFileId] = useState<number | null>(null);
+  const [fileAnalyses, setFileAnalyses] = useState<Record<number, SubtitleFile["analysis"]>>({});
+  const [jobNextCursor, setJobNextCursor] = useState<number | null>(null);
+  const [fileNextCursor, setFileNextCursor] = useState<number | null>(null);
+  const [backupNextCursor, setBackupNextCursor] = useState<number | null>(null);
+  const refreshPromise = useRef<Promise<void> | null>(null);
+  const refreshQueued = useRef(false);
+  const refreshTimer = useRef<number | null>(null);
+  const jobFilterRef = useRef(jobFilter);
+  const analysisKeys = useRef<Record<number, string>>({});
 
   const authRequired = status?.config.auth_required ?? true;
   const loggedIn = !authRequired || Boolean(csrf);
   const recentFile = files[0];
+  const selectedFile = files.find((file) => file.id === selectedFileId) ?? recentFile;
+  const detailFile = selectedFile
+    ? { ...selectedFile, analysis: fileAnalyses[selectedFile.id] }
+    : undefined;
   const jobCounts = status?.jobs ?? {};
   const controls = status?.config.controls;
   const conversionParallelism = controls?.conversion_parallelism ?? status?.config.max_concurrent_jobs ?? 1;
@@ -107,44 +123,84 @@ export default function App() {
     }
   }, [status?.config.scan_interval_seconds]);
 
-  async function loadAll(action: ActionName = "refresh") {
-    setBusy(action);
-    setError("");
+  jobFilterRef.current = jobFilter;
+
+  async function refreshOnce(action: ActionName, quiet: boolean) {
+    if (!quiet) {
+      setBusy(action);
+      setError("");
+    }
+    const nextStatus = await apiRequest<StatusResponse>("/api/status");
+    setStatus(nextStatus);
+    if (nextStatus.config.auth_required && !csrf) {
+      setJobs([]);
+      setBackups([]);
+      setFiles([]);
+      return;
+    }
+    const activeFilter = jobFilterRef.current;
+    const jobParams = new URLSearchParams({ limit: "100" });
+    if (activeFilter in statusLabels && activeFilter !== "new") {
+      jobParams.set("status", activeFilter);
+    } else if (activeFilter in modeLabels) {
+      jobParams.set("mode", activeFilter);
+    }
+    const [nextFiles, nextJobs, nextBackups] = await Promise.all([
+      apiRequest<FilesResponse>("/api/files?limit=50"),
+      apiRequest<JobsResponse>(`/api/jobs?${jobParams.toString()}`),
+      apiRequest<BackupsResponse>("/api/backups?limit=100"),
+    ]);
+    setFiles(nextFiles.files);
+    setSelectedFileId((current) => (
+      current && nextFiles.files.some((file) => file.id === current)
+        ? current
+        : nextFiles.files[0]?.id ?? null
+    ));
+    setJobs(nextJobs.jobs);
+    setJobNextCursor(nextJobs.next_cursor ?? null);
+    setFileNextCursor(nextFiles.next_cursor ?? null);
+    setBackups(nextBackups.backups);
+    setBackupNextCursor(nextBackups.next_cursor ?? null);
+  }
+
+  async function loadAll(action: ActionName = "refresh", quiet = false) {
+    if (refreshPromise.current) {
+      refreshQueued.current = true;
+      await refreshPromise.current;
+      return;
+    }
+    const run = async () => {
+      do {
+        refreshQueued.current = false;
+        try {
+          await refreshOnce(action, quiet);
+        } catch (err) {
+          if (err instanceof ApiError && err.status === 401) {
+            localStorage.removeItem(CSRF_KEY);
+            setCsrf("");
+            setError("需要登录后查看服务控制台。");
+          } else if (!quiet) {
+            setError(readError(err));
+          }
+        }
+      } while (refreshQueued.current);
+    };
+    refreshPromise.current = run();
     try {
-      const nextStatus = await apiRequest<StatusResponse>("/api/status");
-      setStatus(nextStatus);
-      if (nextStatus.config.auth_required && !csrf) {
-        setJobs([]);
-        setBackups([]);
-        setFiles([]);
-        return;
-      }
-      const [nextFiles, nextJobs, nextBackups] = await Promise.all([
-        apiRequest<FilesResponse>("/api/files"),
-        apiRequest<JobsResponse>("/api/jobs"),
-        apiRequest<BackupsResponse>("/api/backups"),
-      ]);
-      setFiles(nextFiles.files);
-      setJobs(nextJobs.jobs);
-      setBackups(nextBackups.backups);
-    } catch (err) {
-      if (err instanceof ApiError && err.status === 401) {
-        localStorage.removeItem(CSRF_KEY);
-        setCsrf("");
-        setError("需要登录后查看服务控制台。");
-      } else {
-        setError(readError(err));
-      }
+      await refreshPromise.current;
     } finally {
-      setBusy(null);
+      refreshPromise.current = null;
+      if (!quiet) {
+        setBusy(null);
+      }
     }
   }
 
   useEffect(() => {
     void loadAll();
-    const timer = window.setInterval(() => void loadAll(), 15000);
+    const timer = window.setInterval(() => void loadAll("refresh", true), 15000);
     return () => window.clearInterval(timer);
-  }, [csrf]);
+  }, [csrf, jobFilter]);
 
   useEffect(() => {
     if (!loggedIn) {
@@ -154,16 +210,63 @@ export default function App() {
     const pushEvent = (event: MessageEvent) => {
       const payload = JSON.parse(event.data) as EventPayload;
       setEvents((items) => [payload, ...items].slice(0, 80));
-      if (payload.level === "ok" || payload.level === "err") {
-        void loadAll();
+      if (payload.kind === "scan" && payload.level === "info") {
+        if (refreshTimer.current !== null) {
+          window.clearTimeout(refreshTimer.current);
+        }
+        refreshTimer.current = window.setTimeout(() => {
+          refreshTimer.current = null;
+          void apiRequest<StatusResponse>("/api/status").then(setStatus).catch(() => undefined);
+        }, 500);
+      } else if (payload.level === "ok" || payload.level === "err") {
+        if (refreshTimer.current !== null) {
+          window.clearTimeout(refreshTimer.current);
+        }
+        refreshTimer.current = window.setTimeout(() => {
+          refreshTimer.current = null;
+          void loadAll("refresh", true);
+        }, 750);
       }
     };
     source.onmessage = pushEvent;
     for (const name of ["job", "scan", "index", "backup", "upload", "config"]) {
       source.addEventListener(name, (event) => pushEvent(event as MessageEvent));
     }
-    return () => source.close();
-  }, [loggedIn]);
+    return () => {
+      source.close();
+      if (refreshTimer.current !== null) {
+        window.clearTimeout(refreshTimer.current);
+        refreshTimer.current = null;
+      }
+    };
+  }, [loggedIn, jobFilter]);
+
+  useEffect(() => {
+    if (!loggedIn || !selectedFile || uploadFile) {
+      return;
+    }
+    const key = `${selectedFile.id}:${selectedFile.size}:${selectedFile.mtime}`;
+    if (analysisKeys.current[selectedFile.id] === key) {
+      return;
+    }
+    analysisKeys.current[selectedFile.id] = key;
+    let cancelled = false;
+    void apiRequest<FileAnalysisResponse>(`/api/files/${selectedFile.id}/analysis`)
+      .then((result) => {
+        if (!cancelled) {
+          setFileAnalyses((items) => ({ ...items, [selectedFile.id]: result.analysis }));
+        }
+      })
+      .catch((err) => {
+        delete analysisKeys.current[selectedFile.id];
+        if (!cancelled) {
+          setError(readError(err));
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [loggedIn, selectedFile?.id, selectedFile?.size, selectedFile?.mtime, uploadFile]);
 
   async function login(event: FormEvent) {
     event.preventDefault();
@@ -288,6 +391,63 @@ export default function App() {
     }
   }
 
+  async function loadMoreJobs() {
+    if (!jobNextCursor) {
+      return;
+    }
+    setBusy("jobs-more");
+    setError("");
+    try {
+      const params = new URLSearchParams({ limit: "100", cursor: String(jobNextCursor) });
+      if (jobFilter in statusLabels && jobFilter !== "new") {
+        params.set("status", jobFilter);
+      } else if (jobFilter in modeLabels) {
+        params.set("mode", jobFilter);
+      }
+      const page = await apiRequest<JobsResponse>(`/api/jobs?${params.toString()}`);
+      setJobs((items) => mergeById(items, page.jobs));
+      setJobNextCursor(page.next_cursor ?? null);
+    } catch (err) {
+      setError(readError(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function loadMoreFiles() {
+    if (!fileNextCursor) {
+      return;
+    }
+    setBusy("files-more");
+    setError("");
+    try {
+      const page = await apiRequest<FilesResponse>(`/api/files?limit=50&cursor=${fileNextCursor}`);
+      setFiles((items) => mergeById(items, page.files));
+      setFileNextCursor(page.next_cursor ?? null);
+    } catch (err) {
+      setError(readError(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function loadMoreBackups() {
+    if (!backupNextCursor) {
+      return;
+    }
+    setBusy("backups-more");
+    setError("");
+    try {
+      const page = await apiRequest<BackupsResponse>(`/api/backups?limit=100&cursor=${backupNextCursor}`);
+      setBackups((items) => mergeById(items, page.backups));
+      setBackupNextCursor(page.next_cursor ?? null);
+    } catch (err) {
+      setError(readError(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
   function submitSchedule(event: FormEvent) {
     event.preventDefault();
     const minutes = Number(scheduleMinutes);
@@ -335,14 +495,14 @@ export default function App() {
 
       <header className="topbar glass-surface">
         <div>
-          <p className="eyebrow">ASS/SSA subset service</p>
+          <p className="eyebrow">ASS/SSA subset service {status?.version ? `v${status.version}` : ""}</p>
           <h1>控制台</h1>
           <p className="subtitle">ArisNAS字幕子集化自动化服务</p>
         </div>
         <div className="top-actions">
           <IconButton label="刷新" title="重新读取状态、文件、作业和备份列表。" icon={<RefreshCw size={18} />} busy={busy === "refresh"} onClick={() => void loadAll()} />
-          <IconButton label="扫描" title="扫描所有监听目录，并将未处理字幕加入队列。" icon={<ScanSearch size={18} />} busy={busy === "scan"} onClick={() => void runAction("scan", "/api/scan")} disabled={!loggedIn} />
-          <IconButton label="重建索引" title="重新扫描字体库并刷新 SQLite 字体索引。" icon={<Database size={18} />} busy={busy === "rebuild"} onClick={() => void runAction("rebuild", "/api/index/rebuild")} disabled={!loggedIn} />
+          <IconButton label="扫描" title="扫描所有监听目录，并将未处理字幕加入队列。" icon={<ScanSearch size={18} />} busy={busy === "scan"} onClick={() => void runAction("scan", "/api/scan")} disabled={!loggedIn || controls?.scan_running} />
+          <IconButton label="重建索引" title="重新扫描字体库并刷新 SQLite 字体索引。" icon={<Database size={18} />} busy={busy === "rebuild"} onClick={() => void runAction("rebuild", "/api/index/rebuild")} disabled={!loggedIn || controls?.index_running} />
         </div>
       </header>
 
@@ -370,6 +530,12 @@ export default function App() {
             <Metric label="索引错误" value={status?.fonts.errors ?? 0} tone={status?.fonts.errors ? "bad" : "ok"} />
             <Metric label="并发索引" value={status?.config.max_index_concurrency ?? 0} />
           </MetricGrid>
+          <MetricGrid>
+            <Metric label="缓存占用" value={formatBytes(status?.metrics?.cache?.bytes)} />
+            <Metric label="缓存命中" value={`${(status?.metrics?.cache?.hit_rate_percent ?? 0).toFixed(1)}%`} />
+            <Metric label="队列 P95" value={formatDurationMs(status?.metrics?.queue?.p95_ms)} />
+            <Metric label="Worker 重启" value={status?.metrics?.workers?.restarts ?? 0} tone={status?.metrics?.workers?.restarts ? "bad" : "ok"} />
+          </MetricGrid>
           <PathList title="字体目录" items={status?.config.font_dirs ?? []} />
         </StepPanel>
 
@@ -380,17 +546,18 @@ export default function App() {
               <strong>{status?.subtitles.files ?? 0} 个字幕文件</strong>
               <span>扫描已配置的容器内目录，未处理字幕会自动入队。</span>
             </div>
-            <IconButton label="扫描目录" title="立即扫描所有监听目录。" icon={<Play size={16} />} busy={busy === "scan"} onClick={() => void runAction("scan", "/api/scan")} disabled={!loggedIn} />
+            <IconButton label="扫描目录" title="立即扫描所有监听目录。" icon={<Play size={16} />} busy={busy === "scan"} onClick={() => void runAction("scan", "/api/scan")} disabled={!loggedIn || controls?.scan_running} />
             <IconButton
               label={controls?.scan_paused ? "继续扫描" : "暂停扫描"}
               title={controls?.scan_paused ? "继续当前扫描步骤。" : "暂停正在进行的扫描步骤。"}
               icon={controls?.scan_paused ? <Play size={16} /> : <Pause size={16} />}
               busy={busy === "scan-control"}
               onClick={() => void runAction("scan-control", controls?.scan_paused ? "/api/scan/resume" : "/api/scan/pause")}
-              disabled={!loggedIn}
+              disabled={!loggedIn || !controls?.scan_running}
             />
-            <IconButton label="取消扫描" title="取消当前扫描步骤。" icon={<X size={16} />} busy={busy === "scan-cancel"} onClick={() => void runAction("scan-cancel", "/api/scan/cancel")} disabled={!loggedIn} danger />
+            <IconButton label="取消扫描" title="取消当前扫描步骤。" icon={<X size={16} />} busy={busy === "scan-cancel"} onClick={() => void runAction("scan-cancel", "/api/scan/cancel")} disabled={!loggedIn || !controls?.scan_running} danger />
           </div>
+          <ScanProgress progress={controls?.scan_progress} running={Boolean(controls?.scan_running)} />
           <form className="schedule-card" onSubmit={submitSchedule}>
             <div>
               <Clock3 size={16} />
@@ -458,8 +625,9 @@ export default function App() {
             <IconButton label="转换最新文件" title={recentFile ? "对最近扫描或上传的字幕执行字体子集化。" : "请先扫描目录或上传字幕文件。"} icon={<Play size={16} />} disabled={!recentFile} busy={recentFile ? busy === `process-${recentFile.id}` : false} onClick={() => recentFile && void runAction(`process-${recentFile.id}`, `/api/files/${recentFile.id}/process`)} />
             <IconButton label="清理并还原" title={recentFile ? "移除可还原的内嵌字体，并恢复随机字体名和绘图指令。" : "请先扫描目录或上传字幕文件。"} icon={<Trash2 size={16} />} disabled={!recentFile || !status?.capabilities?.strip_embedded} busy={recentFile ? busy === `strip-${recentFile.id}` : false} onClick={() => recentFile && void runAction(`strip-${recentFile.id}`, `/api/files/${recentFile.id}/strip-embedded`)} />
           </div>
-          <SubtitleDetails file={recentFile} uploadFile={uploadFile} />
-          <FileTable files={files} canModify={loggedIn} busy={busy} onAction={runAction} />
+          <SubtitleDetails file={detailFile} uploadFile={uploadFile} />
+          <FileTable files={files} selectedId={selectedFile?.id} canModify={loggedIn} busy={busy} onSelect={setSelectedFileId} onAction={runAction} />
+          {fileNextCursor ? <div className="page-actions"><IconButton label="加载更多字幕" title="继续读取较早的字幕记录。" icon={<ChevronDown size={16} />} busy={busy === "files-more"} onClick={() => void loadMoreFiles()} /></div> : null}
         </StepPanel>
 
         <StepPanel number="4" title="转换与恢复" icon={<ArchiveRestore size={20} />}>
@@ -479,6 +647,7 @@ export default function App() {
               disabled={!loggedIn}
             />
             <IconButton label="取消队列" title="取消尚未开始的转换任务。" icon={<X size={16} />} busy={busy === "conversion-cancel"} onClick={() => void runAction("conversion-cancel", "/api/conversion/cancel")} disabled={!loggedIn} danger />
+            <IconButton label="保存错误日志" title="将当前失败作业的文件名、路径和错误原因保存到数据目录的 error-logs 文件夹。" icon={<FileText size={16} />} busy={busy === "failed-log"} onClick={() => void runAction("failed-log", "/api/jobs/failed-log")} disabled={!loggedIn || !(jobCounts.failed ?? 0)} />
             <div className="stepper-field">
               <span className="stepper-label">并行</span>
               <div className="stepper" data-tooltip="调整同时运行的转换任务数。">
@@ -503,7 +672,9 @@ export default function App() {
             </select>
           </div>
           <JobTable jobs={filteredJobs} busy={busy} onRetry={(job) => void runAction(`retry-${job.id}`, `/api/jobs/${job.id}/retry`)} />
+          {jobNextCursor ? <div className="page-actions"><IconButton label="加载更多作业" title="继续读取较早的作业记录。" icon={<ChevronDown size={16} />} busy={busy === "jobs-more"} onClick={() => void loadMoreJobs()} /></div> : null}
           <BackupTable backups={backups} busy={busy} onRestore={setRestoreTarget} />
+          {backupNextCursor ? <div className="page-actions"><IconButton label="加载更多备份" title="继续读取较早的备份记录。" icon={<ChevronDown size={16} />} busy={busy === "backups-more"} onClick={() => void loadMoreBackups()} /></div> : null}
         </StepPanel>
       </section>
 
@@ -600,6 +771,47 @@ function WatchDirList({ items, busy, onRemove }: { items: Array<{ path: string; 
   );
 }
 
+function ScanProgress({
+  progress,
+  running,
+}: {
+  progress?: NonNullable<StatusResponse["config"]["controls"]>["scan_progress"];
+  running: boolean;
+}) {
+  if (!progress?.stage) {
+    return null;
+  }
+  const stageLabels: Record<string, string> = {
+    discovering: "发现文件",
+    filtering: "筛选任务",
+    enqueuing: "加入队列",
+    completed: "扫描完成",
+    cancelled: "扫描已取消",
+    failed: "扫描失败",
+  };
+  const total = progress.total ?? 0;
+  const current = progress.current ?? 0;
+  const percent = total > 0 ? Math.min(100, Math.round((current / total) * 100)) : 0;
+  return (
+    <div className="scan-progress" data-running={running ? "true" : "false"}>
+      <div>
+        <strong>{stageLabels[progress.stage] ?? progress.stage}</strong>
+        <span>{total > 0 ? `${current} / ${total}` : `${progress.seen ?? 0}`}</span>
+      </div>
+      <div className="progress-track" data-indeterminate={running && total === 0 ? "true" : "false"}>
+        <i style={{ width: total > 0 ? `${percent}%` : running ? "28%" : "100%" }} />
+      </div>
+      <dl>
+        <div><dt>发现</dt><dd>{progress.seen ?? 0}</dd></div>
+        <div><dt>待转换</dt><dd>{progress.ready ?? 0}</dd></div>
+        <div><dt>已入队</dt><dd>{progress.queued ?? 0}</dd></div>
+        <div><dt>跳过</dt><dd>{progress.skipped ?? 0}</dd></div>
+        <div><dt>失败</dt><dd>{progress.failed ?? 0}</dd></div>
+      </dl>
+    </div>
+  );
+}
+
 function SubtitleDetails({ file, uploadFile }: { file?: SubtitleFile; uploadFile: File | null }) {
   const serviceFile = uploadFile ? undefined : file;
   const analysis = serviceFile?.analysis;
@@ -655,7 +867,21 @@ function DetailGroup({ title, badge, items, empty }: { title: string; badge: str
   );
 }
 
-function FileTable({ files, canModify, busy, onAction }: { files: SubtitleFile[]; canModify: boolean; busy: string | null; onAction: (action: ActionName, path: string) => Promise<void> }) {
+function FileTable({
+  files,
+  selectedId,
+  canModify,
+  busy,
+  onSelect,
+  onAction,
+}: {
+  files: SubtitleFile[];
+  selectedId?: number;
+  canModify: boolean;
+  busy: string | null;
+  onSelect: (id: number) => void;
+  onAction: (action: ActionName, path: string) => Promise<void>;
+}) {
   return (
     <div className="table-wrap">
       <table>
@@ -668,12 +894,13 @@ function FileTable({ files, canModify, busy, onAction }: { files: SubtitleFile[]
           </tr>
         </thead>
         <tbody>
-          {files.length ? files.slice(0, 8).map((file) => (
-            <tr key={file.id}>
+          {files.length ? files.map((file) => (
+            <tr key={file.id} data-selected={file.id === selectedId ? "true" : "false"}>
               <td><code>{file.relative_path || file.path}</code></td>
               <td><StatusBadge status={file.last_status ?? "new"} /></td>
               <td>{formatBytes(file.size)}</td>
               <td className="row-actions">
+                <IconButton label="详情" title="在上方查看这个字幕的按需分析结果。" icon={<Eye size={14} />} compact busy={busy === `detail-${file.id}`} onClick={() => onSelect(file.id)} />
                 <IconButton label="转换" title="对这个字幕执行字体子集化。" icon={<Play size={14} />} compact disabled={!canModify} busy={busy === `process-${file.id}`} onClick={() => void onAction(`process-${file.id}`, `/api/files/${file.id}/process`)} />
                 <IconButton label="清理" title="清理内嵌字体并尽量还原随机名、绘图指令。" icon={<Trash2 size={14} />} compact disabled={!canModify} busy={busy === `strip-${file.id}`} onClick={() => void onAction(`strip-${file.id}`, `/api/files/${file.id}/strip-embedded`)} />
                 <a className="icon-link" href={`/api/files/${file.id}/download`} data-tooltip="下载当前版本字幕。">
@@ -705,7 +932,7 @@ function JobTable({ jobs, busy, onRetry }: { jobs: Job[]; busy: string | null; o
           </tr>
         </thead>
         <tbody>
-          {jobs.length ? jobs.slice(0, 12).map((job) => (
+          {jobs.length ? jobs.map((job) => (
             <tr key={job.id}>
               <td>
                 <span className="job-id">#{job.id}</span>
@@ -823,12 +1050,18 @@ function summarizeStats(job: Job) {
   return `${stats.embedded_count ?? 0} 字体 / ${stats.missing_count ?? 0} 缺失 / ${stats.draw_fonts_created ?? 0} 绘图字体`;
 }
 
+function mergeById<T extends { id: number }>(current: T[], next: T[]): T[] {
+  const ids = new Set(current.map((item) => item.id));
+  return [...current, ...next.filter((item) => !ids.has(item.id))];
+}
+
 function eventKindLabel(kind: string) {
   return {
     scan: "扫描",
     job: "作业",
     index: "索引",
     backup: "备份",
+    cache: "缓存",
     upload: "上传",
     config: "配置",
   }[kind] ?? kind;
@@ -895,6 +1128,16 @@ function formatBytes(value?: number) {
     i += 1;
   }
   return `${n.toFixed(i ? 1 : 0)} ${units[i]}`;
+}
+
+function formatDurationMs(value?: number) {
+  if (!value) {
+    return "0 ms";
+  }
+  if (value < 1000) {
+    return `${value} ms`;
+  }
+  return `${(value / 1000).toFixed(1)} s`;
 }
 
 function formatTime(value?: string) {

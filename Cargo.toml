@@ -1,11 +1,12 @@
 [package]
 name = "ass-subset-service"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
 
 [dependencies]
 anyhow = "1.0"
+argon2 = "0.5"
 async-stream = "0.3"
 axum = { version = "0.8", features = ["macros", "multipart"] }
 base64 = "0.22"
@@ -21,6 +22,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "chrono", "json"] }
+subtle = "2.6"
 tokio = { version = "1.48", features = ["full"] }
 tower-http = { version = "0.6", features = ["fs", "trace"] }
 tracing = "0.1"

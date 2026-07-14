@@ -26,6 +26,8 @@ from fontTools.ttLib import TTCollection, TTFont
 from fontTools.ttLib.tables.DefaultTable import DefaultTable
 from fontTools.ttLib.ttCollection import TTCollection as TTCollectionClass
 from fontTools.pens.ttGlyphPen import TTGlyphPen
+from fontTools.pens.cu2quPen import Cu2QuPen
+from fontTools.varLib.instancer import instantiateVariableFont
 
 
 NAME_KINDS = {
@@ -163,13 +165,19 @@ def inspect_font(path: str) -> dict[str, Any]:
         return {"faces": faces}
 
 
-def load_font(path: str, ttc_index: int) -> TTFont:
+def load_font(path: str, ttc_index: int, *, lazy: bool = False) -> TTFont:
     if ttc_index is not None and ttc_index >= 0:
-        return TTFont(path, fontNumber=ttc_index, lazy=False)
-    return TTFont(path, lazy=False)
+        return TTFont(path, fontNumber=ttc_index, lazy=lazy)
+    return TTFont(path, lazy=lazy)
 
 
-def set_name_table(font: TTFont, target_family: str, subfamily: str, randomize_map: dict[str, str] | None) -> None:
+def set_name_table(
+    font: TTFont,
+    target_family: str,
+    subfamily: str,
+    randomize_map: dict[str, str] | None,
+    service_version: str,
+) -> None:
     if "name" not in font:
         return
     name_table = font["name"]
@@ -187,7 +195,7 @@ def set_name_table(font: TTFont, target_family: str, subfamily: str, randomize_m
     if randomize_map:
         desc_suffix = (
             f"FontSubsetMap: {{original: {randomize_map['original']}, "
-            f"subset: {randomize_map['subset']}, ass-subset: 2.7, ass-subset-service: 0.1.0}}; "
+            f"subset: {randomize_map['subset']}, ass-subset: 2.7, ass-subset-service: {service_version}}}; "
             "ASS Subsetter (Docker service)"
         )
         replacements[10] = desc_suffix
@@ -223,11 +231,16 @@ def subset_font(payload: dict[str, Any]) -> dict[str, Any]:
     codepoints = sorted({int(cp) for cp in payload.get("codepoints", [])})
     if payload.get("include_ascii", True):
         codepoints = sorted(set(codepoints).union(range(0x20, 0x7F)))
-    font = load_font(source_path, ttc_index)
+    full_font = bool(payload.get("full_font", False))
+    # Full embedding deliberately keeps untouched tables lazy. This allows a
+    # malformed cmap to be copied verbatim while the name table is rewritten.
+    font = load_font(source_path, ttc_index, lazy=full_font)
     try:
         orig_size = os.path.getsize(source_path)
-        used = present_codepoints(font, codepoints)
-        if not payload.get("full_font", False):
+        if "fvar" in font and not payload.get("retain_variations", False):
+            font = instantiateVariableFont(font, {}, inplace=True, optimize=True)
+        used = codepoints if full_font else present_codepoints(font, codepoints)
+        if not full_font:
             opts = subset.Options()
             opts.name_IDs = ["*"]
             opts.name_legacy = True
@@ -244,6 +257,7 @@ def subset_font(payload: dict[str, Any]) -> dict[str, Any]:
             payload["target_family"],
             payload.get("subfamily") or "Regular",
             payload.get("randomize_map"),
+            str(payload.get("service_version") or "unknown"),
         )
         font.flavor = None
         font.save(output_path)
@@ -400,9 +414,10 @@ def draw_glyph(data: str, flags: int) -> Any:
     coords = []
     for _, nums in ops:
         coords.extend((nums[i], nums[i + 1]) for i in range(0, len(nums), 2))
-    pen = TTGlyphPen(None)
+    glyph_pen = TTGlyphPen(None)
+    pen = Cu2QuPen(glyph_pen, max_err=1.0, reverse_direction=False)
     if not coords:
-        return pen.glyph()
+        return glyph_pen.glyph()
     min_x = min(x for x, _ in coords)
     max_x = max(x for x, _ in coords)
     min_y = min(y for _, y in coords)
@@ -440,7 +455,7 @@ def draw_glyph(data: str, flags: int) -> Any:
             has_open = False
     if has_open:
         pen.closePath()
-    return pen.glyph()
+    return glyph_pen.glyph()
 
 
 def create_draw_font(payload: dict[str, Any]) -> dict[str, Any]:
@@ -473,7 +488,10 @@ def create_draw_font(payload: dict[str, Any]) -> dict[str, Any]:
         "fullName": family,
         "psName": f"{family}-Regular",
         "version": "Version 1.0",
-        "description": "ASS draw subset font; ass-subset: 2.7",
+        "description": (
+            "ASS draw subset font; ass-subset: 2.7; "
+            f"ass-subset-service: {payload.get('service_version') or 'unknown'}"
+        ),
     })
     fb.setupPost()
     font = fb.font

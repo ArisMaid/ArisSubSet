@@ -1,9 +1,16 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
 
 use anyhow::{Context, bail};
 use regex::Regex;
 
 use crate::models::{EmbeddedFont, FontSlot};
+
+static DRAW_RESTORE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\{([^}]*)\\fn(ASSDrawSubset[^\\}]*)[^}]*\}([^\{])").expect("draw restore regex")
+});
+static FONT_TAG_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\\fn([^\\}]*)").expect("font tag regex"));
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BomKind {
@@ -82,7 +89,6 @@ impl FontUsage {
 #[derive(Clone, Debug)]
 pub struct ParsedSubtitle {
     pub newline: String,
-    pub styles: HashMap<String, StyleInfo>,
     pub usages: HashMap<String, FontUsage>,
     pub drawing_count: usize,
 }
@@ -165,7 +171,7 @@ pub fn encode_subtitle(text: &str, bom: &BomKind) -> Vec<u8> {
 }
 
 fn decode_utf16(bytes: &[u8], little: bool) -> anyhow::Result<String> {
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         bail!("UTF-16 subtitle has an odd byte length");
     }
     let words: Vec<u16> = bytes
@@ -274,7 +280,6 @@ pub fn parse_subtitle(text: &str) -> ParsedSubtitle {
 
     ParsedSubtitle {
         newline,
-        styles,
         usages,
         drawing_count,
     }
@@ -290,41 +295,51 @@ fn parse_dialogue_text(
     let mut drawing_level = 0i32;
     let mut drawing_count = 0usize;
     let mut i = 0usize;
-    let chars: Vec<char> = text.chars().collect();
 
-    while i < chars.len() {
-        if chars[i] == '{' {
-            if let Some(end) = chars[i + 1..].iter().position(|c| *c == '}') {
-                let tag: String = chars[i + 1..i + 1 + end].iter().collect();
-                let was_drawing = drawing_level > 0;
-                apply_override_tags(&tag, &mut state, base_style, styles, &mut drawing_level);
-                if !was_drawing && drawing_level > 0 {
-                    drawing_count += 1;
-                }
-                i += end + 2;
-                continue;
+    while i < text.len() {
+        if text.as_bytes()[i] == b'{'
+            && let Some(end_rel) = text[i + 1..].find('}')
+        {
+            let end = i + 1 + end_rel;
+            let tag = &text[i + 1..end];
+            let was_drawing = drawing_level > 0;
+            apply_override_tags(tag, &mut state, base_style, styles, &mut drawing_level);
+            if !was_drawing && drawing_level > 0 {
+                drawing_count += 1;
             }
+            i = end + 1;
+            continue;
         }
+        let run_end = match text[i..].find('{') {
+            Some(0) => (i + 1).min(text.len()),
+            Some(offset) => i + offset,
+            None => text.len(),
+        };
         if drawing_level <= 0 {
-            if chars[i] == '\\' && i + 1 < chars.len() {
-                let next = chars[i + 1];
-                if matches!(next, 'N' | 'n' | 'h') {
-                    i += 2;
-                    continue;
-                }
-            }
-            let ch = chars[i];
-            if !ch.is_control() {
-                let slot = slot_for_state(&state);
-                usages
-                    .entry(norm_font(&state.font))
-                    .or_default()
-                    .add(slot, ch as u32);
-            }
+            add_dialogue_text_run(&text[i..run_end], &state, usages);
         }
-        i += 1;
+        i = run_end;
     }
     drawing_count
+}
+
+fn add_dialogue_text_run(text: &str, state: &StyleInfo, usages: &mut HashMap<String, FontUsage>) {
+    let font = norm_font(&state.font);
+    if text.is_empty() || font.is_empty() {
+        return;
+    }
+    let slot = slot_for_state(state);
+    let usage = usages.entry(font).or_default();
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' && matches!(chars.peek(), Some('N' | 'n' | 'h')) {
+            chars.next();
+            continue;
+        }
+        if !ch.is_control() {
+            usage.add(slot, ch as u32);
+        }
+    }
 }
 
 fn apply_override_tags(
@@ -385,10 +400,10 @@ fn apply_override_tags(
 
 fn read_tag_arg(s: &str, start: usize) -> (String, usize) {
     let rest = &s[start..];
-    if let Some(stripped) = rest.strip_prefix('(') {
-        if let Some(end) = stripped.find(')') {
-            return (stripped[..end].to_string(), start + end + 2);
-        }
+    if let Some(stripped) = rest.strip_prefix('(')
+        && let Some(end) = stripped.find(')')
+    {
+        return (stripped[..end].to_string(), start + end + 2);
     }
     let end = rest.find('\\').unwrap_or(rest.len());
     (rest[..end].trim().to_string(), start + end)
@@ -793,16 +808,15 @@ fn restore_draw_font_runs(line: &str, draw_map: &HashMap<String, DrawRestoreEntr
     if draw_map.is_empty() {
         return line.to_string();
     }
-    let re = Regex::new(r"\{([^}]*)\\fn(ASSDrawSubset[^\\}]*)[^}]*\}([^\{])")
-        .expect("draw restore regex");
-    re.replace_all(line, |caps: &regex::Captures<'_>| {
-        let ch = caps.get(3).map(|m| m.as_str()).unwrap_or("");
-        draw_map
-            .get(ch)
-            .map(|entry| entry.data.clone())
-            .unwrap_or_else(|| caps.get(0).unwrap().as_str().to_string())
-    })
-    .to_string()
+    DRAW_RESTORE_RE
+        .replace_all(line, |caps: &regex::Captures<'_>| {
+            let ch = caps.get(3).map(|m| m.as_str()).unwrap_or("");
+            draw_map
+                .get(ch)
+                .map(|entry| entry.data.clone())
+                .unwrap_or_else(|| caps.get(0).unwrap().as_str().to_string())
+        })
+        .to_string()
 }
 
 fn build_fonts_section(embedded_fonts: &[EmbeddedFont], newline: &str) -> String {
@@ -873,17 +887,17 @@ fn rewrite_fn_tags(line: &str, rename_map: &HashMap<String, String>) -> String {
     if rename_map.is_empty() {
         return line.to_string();
     }
-    let re = Regex::new(r"\\fn([^\\}]*)").expect("fn regex");
-    re.replace_all(line, |caps: &regex::Captures<'_>| {
-        let old = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-        let key = norm_font(old).to_ascii_lowercase();
-        if let Some(new_name) = rename_map.get(&key) {
-            format!("\\fn{new_name}")
-        } else {
-            caps.get(0).unwrap().as_str().to_string()
-        }
-    })
-    .to_string()
+    FONT_TAG_RE
+        .replace_all(line, |caps: &regex::Captures<'_>| {
+            let old = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            let key = norm_font(old).to_ascii_lowercase();
+            if let Some(new_name) = rename_map.get(&key) {
+                format!("\\fn{new_name}")
+            } else {
+                caps.get(0).unwrap().as_str().to_string()
+            }
+        })
+        .to_string()
 }
 
 pub fn ass_uu_encode(bytes: &[u8]) -> String {

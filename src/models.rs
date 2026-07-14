@@ -22,12 +22,9 @@ pub struct FontNameInfo {
 #[derive(Debug, Clone)]
 pub struct FontCandidate {
     pub file_id: i64,
-    pub face_id: i64,
     pub path: String,
     pub full_hash: String,
     pub ttc_index: i32,
-    pub family: String,
-    pub subfamily: String,
     pub weight: i32,
     pub italic: bool,
 }
@@ -75,8 +72,6 @@ pub struct EmbeddedFont {
     pub embedded_name: String,
     pub slot: FontSlot,
     pub data: Vec<u8>,
-    pub orig_size: u64,
-    pub subset_size: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
