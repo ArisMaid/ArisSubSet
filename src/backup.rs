@@ -143,16 +143,54 @@ pub async fn prune_expired(state: &Arc<AppState>) -> anyhow::Result<BackupPruneS
 }
 
 pub async fn restore(state: &Arc<AppState>, backup_id: i64) -> anyhow::Result<()> {
+    let _scan_guard = state
+        .try_begin_scan()
+        .context("扫描正在运行，请等待扫描结束后恢复")?;
+    if !state.scan_interval().await.is_zero() || !state.conversion_paused().await {
+        bail!(
+            "恢复前请关闭定时扫描并暂停新转换任务，等待当前任务结束；恢复后按需手动转换或重新开启扫描。"
+        );
+    }
+    let mut tx = state.db.pool.begin().await?;
+    // Serialize against job insertion until the replacement and state reset finish.
+    crate::sqlx::query(
+        "UPDATE subtitle_files SET id=id WHERE id=(SELECT subtitle_id FROM backups WHERE id=?)",
+    )
+    .bind(backup_id)
+    .execute(&mut *tx)
+    .await?;
     let row = crate::sqlx::query("SELECT source_path, backup_path FROM backups WHERE id = ?")
         .bind(backup_id)
-        .fetch_one(&state.db.pool)
+        .fetch_one(&mut *tx)
         .await?;
     let source_path: String = row.get("source_path");
     let backup_path: String = row.get("backup_path");
+    let active: i64 = crate::sqlx::query_scalar(
+        "SELECT COUNT(*) FROM jobs WHERE path=? AND status IN ('queued', 'running')",
+    )
+    .bind(&source_path)
+    .fetch_one(&mut *tx)
+    .await?;
+    if active > 0 {
+        bail!("该字幕仍有排队或运行中的任务。请取消待执行任务，并等待运行中的任务结束后恢复。");
+    }
     if !Path::new(&backup_path).exists() {
         bail!("backup file is missing: {backup_path}");
     }
-    tokio::fs::copy(&backup_path, &source_path).await?;
+    let bytes = tokio::fs::read(&backup_path).await?;
+    crate::processor::write_replace(Path::new(&source_path), &bytes).await?;
+    let meta = tokio::fs::metadata(&source_path).await?;
+    let mtime = meta
+        .modified()?
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs() as i64;
+    crate::sqlx::query("UPDATE subtitle_files SET size=?, mtime=?, sha256='', last_status='restored', last_config_hash=NULL, last_processed_at=NULL, last_font_index_revision=NULL, missing_fonts='[]', error=NULL, analysis=NULL, analysis_size=NULL, analysis_mtime=NULL WHERE path=?")
+        .bind(meta.len() as i64)
+        .bind(mtime)
+        .bind(&source_path)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
     state.events.emit(
         "backup",
         "ok",

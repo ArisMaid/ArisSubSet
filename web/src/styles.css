@@ -1143,3 +1143,8 @@ tr:last-child td {
     width: 100%;
   }
 }
+
+.backup-table {
+  max-height: 30rem;
+  overflow: auto;
+}

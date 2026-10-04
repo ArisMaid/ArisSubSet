@@ -74,7 +74,6 @@ export type StatusResponse = {
       scan_paused?: boolean;
       scan_cancel_requested?: boolean;
       conversion_paused?: boolean;
-      conversion_cancel_requested?: boolean;
       conversion_parallelism?: number;
       scan_running?: boolean;
       index_running?: boolean;

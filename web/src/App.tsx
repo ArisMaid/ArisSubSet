@@ -69,6 +69,8 @@ const statusLabels: Record<string, string> = {
   running: "运行中",
   success: "完成",
   partial: "部分完成",
+  skipped: "已跳过／未验证",
+  restored: "已恢复／待处理",
   failed: "失败",
   cancelled: "已取消",
 };
@@ -100,6 +102,12 @@ export default function App() {
   const [jobNextCursor, setJobNextCursor] = useState<number | null>(null);
   const [fileNextCursor, setFileNextCursor] = useState<number | null>(null);
   const [backupNextCursor, setBackupNextCursor] = useState<number | null>(null);
+  const [browsingHistory, setBrowsingHistory] = useState(false);
+  const historyRef = useRef(false);
+  function setHistory(value: boolean) {
+    historyRef.current = value;
+    setBrowsingHistory(value);
+  }
   const refreshPromise = useRef<Promise<void> | null>(null);
   const refreshQueued = useRef(false);
   const refreshTimer = useRef<number | null>(null);
@@ -138,6 +146,7 @@ export default function App() {
       setFiles([]);
       return;
     }
+    if (historyRef.current) return;
     const activeFilter = jobFilterRef.current;
     const jobParams = new URLSearchParams({ limit: "100" });
     if (activeFilter in statusLabels && activeFilter !== "new") {
@@ -150,6 +159,7 @@ export default function App() {
       apiRequest<JobsResponse>(`/api/jobs?${jobParams.toString()}`),
       apiRequest<BackupsResponse>("/api/backups?limit=100"),
     ]);
+    if (historyRef.current) return;
     setFiles(nextFiles.files);
     setSelectedFileId((current) => (
       current && nextFiles.files.some((file) => file.id === current)
@@ -197,6 +207,7 @@ export default function App() {
   }
 
   useEffect(() => {
+    setHistory(false);
     void loadAll();
     const timer = window.setInterval(() => void loadAll("refresh", true), 15000);
     return () => window.clearInterval(timer);
@@ -395,6 +406,7 @@ export default function App() {
     if (!jobNextCursor) {
       return;
     }
+    setHistory(true);
     setBusy("jobs-more");
     setError("");
     try {
@@ -418,6 +430,7 @@ export default function App() {
     if (!fileNextCursor) {
       return;
     }
+    setHistory(true);
     setBusy("files-more");
     setError("");
     try {
@@ -435,6 +448,7 @@ export default function App() {
     if (!backupNextCursor) {
       return;
     }
+    setHistory(true);
     setBusy("backups-more");
     setError("");
     try {
@@ -500,12 +514,13 @@ export default function App() {
           <p className="subtitle">ArisNAS字幕子集化自动化服务</p>
         </div>
         <div className="top-actions">
-          <IconButton label="刷新" title="重新读取状态、文件、作业和备份列表。" icon={<RefreshCw size={18} />} busy={busy === "refresh"} onClick={() => void loadAll()} />
+          <IconButton label="刷新" title="重新读取状态、文件、作业和备份列表。" icon={<RefreshCw size={18} />} busy={busy === "refresh"} onClick={() => { setHistory(false); void loadAll(); }} />
           <IconButton label="扫描" title="扫描所有监听目录，并将未处理字幕加入队列。" icon={<ScanSearch size={18} />} busy={busy === "scan"} onClick={() => void runAction("scan", "/api/scan")} disabled={!loggedIn || controls?.scan_running} />
           <IconButton label="重建索引" title="重新扫描字体库并刷新 SQLite 字体索引。" icon={<Database size={18} />} busy={busy === "rebuild"} onClick={() => void runAction("rebuild", "/api/index/rebuild")} disabled={!loggedIn || controls?.index_running} />
         </div>
       </header>
 
+      {browsingHistory ? <p className="notice">正在浏览历史，列表自动刷新已暂停，顶部状态仍会更新。点击“刷新”返回最新记录。</p> : null}
       {error ? <div className="notice error">{error}</div> : null}
 
       {!loggedIn ? (
@@ -595,6 +610,9 @@ export default function App() {
         </StepPanel>
 
         <StepPanel number="3" title="选择操作" icon={<Sparkles size={20} />}>
+          <p className="hint">默认使用推荐配置。请在队列清空后调整；新设置在任务执行时生效，不会自动重做已有子集字幕。</p>
+          <details>
+            <summary>高级处理选项</summary>
           <div className="option-grid">
             {Object.entries(status?.config.options ?? {}).map(([key, enabled]) => (
               <button
@@ -611,6 +629,9 @@ export default function App() {
               </button>
             ))}
           </div>
+
+          </details>
+          <p className="hint">缺失字体仅表示未找到字体名称，不代表已验证所有字形。已有内嵌字体须先恢复原始备份再转换。</p>
 
           <form className="upload-box" onSubmit={(event) => void uploadSubtitle(event)}>
             <label className="file-picker" data-tooltip="选择一个本地 ASS/SSA 文件，上传后立即创建转换作业。">
@@ -634,7 +655,8 @@ export default function App() {
           <div className="queue-summary">
             <Metric label="排队" value={jobCounts.queued ?? 0} />
             <Metric label="运行" value={jobCounts.running ?? 0} />
-            <Metric label="完成" value={(jobCounts.success ?? 0) + (jobCounts.partial ?? 0)} />
+            <Metric label="成功" value={jobCounts.success ?? 0} />
+            <Metric label="需处理" value={jobCounts.partial ?? 0} />
             <Metric label="失败" value={jobCounts.failed ?? 0} tone={jobCounts.failed ? "bad" : "ok"} />
           </div>
           <div className="action-strip">
@@ -646,7 +668,7 @@ export default function App() {
               onClick={() => void runAction("conversion-control", controls?.conversion_paused ? "/api/conversion/resume" : "/api/conversion/pause")}
               disabled={!loggedIn}
             />
-            <IconButton label="取消队列" title="取消尚未开始的转换任务。" icon={<X size={16} />} busy={busy === "conversion-cancel"} onClick={() => void runAction("conversion-cancel", "/api/conversion/cancel")} disabled={!loggedIn} danger />
+            <IconButton label="取消队列" title="取消尚未开始的任务；正在运行的任务继续完成，不会关闭定时扫描。" icon={<X size={16} />} busy={busy === "conversion-cancel"} onClick={() => void runAction("conversion-cancel", "/api/conversion/cancel")} disabled={!loggedIn} danger />
             <IconButton label="保存错误日志" title="将当前失败作业的文件名、路径和错误原因保存到数据目录的 error-logs 文件夹。" icon={<FileText size={16} />} busy={busy === "failed-log"} onClick={() => void runAction("failed-log", "/api/jobs/failed-log")} disabled={!loggedIn || !(jobCounts.failed ?? 0)} />
             <div className="stepper-field">
               <span className="stepper-label">并行</span>
@@ -694,7 +716,7 @@ export default function App() {
         <div className="modal-backdrop" onMouseDown={() => setRestoreTarget(null)}>
           <section className="modal glass-surface" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
             <h2>恢复备份</h2>
-            <p>将覆盖当前字幕文件。</p>
+            <p>将覆盖当前字幕文件。请先关闭定时扫描、暂停新任务，取消该文件的待执行任务并等待运行任务结束。恢复后状态重置为待处理，按需手动转换。</p>
             <code>{restoreTarget.source_path}</code>
             <div className="modal-actions">
               <IconButton label="取消" title="关闭确认窗口。" icon={<RotateCcw size={16} />} onClick={() => setRestoreTarget(null)} />
@@ -944,7 +966,7 @@ function JobTable({ jobs, busy, onRetry }: { jobs: Job[]; busy: string | null; o
               <td><StatusBadge status={job.status} /></td>
               <td>{summarizeStats(job)}</td>
               <td className="row-actions">
-                <IconButton label="重试" title="用相同模式重新创建作业。" icon={<RefreshCw size={14} />} compact disabled={job.status !== "failed" && job.status !== "partial"} busy={busy === `retry-${job.id}`} onClick={() => onRetry(job)} />
+                <IconButton label="重试" title="用相同模式重新创建作业；已有内嵌字体须先恢复原始备份。" icon={<RefreshCw size={14} />} compact disabled={job.status !== "failed" && job.status !== "partial"} busy={busy === `retry-${job.id}`} onClick={() => onRetry(job)} />
               </td>
             </tr>
           )) : (
@@ -958,7 +980,7 @@ function JobTable({ jobs, busy, onRetry }: { jobs: Job[]; busy: string | null; o
 
 function BackupTable({ backups, busy, onRestore }: { backups: Backup[]; busy: string | null; onRestore: (backup: Backup) => void }) {
   return (
-    <div className="table-wrap">
+    <div className="table-wrap backup-table">
       <table>
         <thead>
           <tr>
@@ -968,7 +990,7 @@ function BackupTable({ backups, busy, onRestore }: { backups: Backup[]; busy: st
           </tr>
         </thead>
         <tbody>
-          {backups.length ? backups.slice(0, 8).map((backup) => (
+          {backups.length ? backups.map((backup) => (
             <tr key={backup.id}>
               <td><code>{backup.backup_path}</code></td>
               <td>{formatTime(backup.created_at)}</td>
@@ -1047,7 +1069,7 @@ function summarizeStats(job: Job) {
   if (job.mode === "strip_embedded") {
     return `${stats.embedded_removed_count ?? 0} 移除 / ${stats.random_names_restored ?? 0} 名称 / ${stats.drawings_restored ?? 0} 绘图`;
   }
-  return `${stats.embedded_count ?? 0} 字体 / ${stats.missing_count ?? 0} 缺失 / ${stats.draw_fonts_created ?? 0} 绘图字体`;
+  return `${stats.embedded_count ?? 0} 字体 / ${stats.missing_count ?? 0} 缺失字体 / ${stats.draw_fonts_created ?? 0} 绘图字体`;
 }
 
 function mergeById<T extends { id: number }>(current: T[], next: T[]): T[] {

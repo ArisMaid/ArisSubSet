@@ -582,19 +582,13 @@ async fn mark_already_subsetted(
     crate::sqlx::query(
         r#"
 INSERT INTO subtitle_files(path, root_label, relative_path, size, mtime, sha256, last_config_hash, last_status, last_processed_at, missing_fonts, error, last_font_index_revision)
-VALUES(?, ?, ?, ?, ?, ?, ?, 'success', ?, '[]', NULL, ?)
+VALUES(?, ?, ?, ?, ?, ?, ?, 'skipped', ?, '[]', NULL, ?)
 ON CONFLICT(path) DO UPDATE SET
   root_label=excluded.root_label,
   relative_path=excluded.relative_path,
   size=excluded.size,
   mtime=excluded.mtime,
-  sha256=excluded.sha256,
-  last_config_hash=excluded.last_config_hash,
-  last_status=excluded.last_status,
-  last_processed_at=excluded.last_processed_at,
-  missing_fonts=excluded.missing_fonts,
-  error=NULL,
-  last_font_index_revision=excluded.last_font_index_revision
+  sha256=excluded.sha256
 "#,
     )
     .bind(&candidate.path_s)
@@ -879,6 +873,11 @@ pub async fn enqueue_subtitle_id(
         .fetch_one(&state.db.pool)
         .await?;
     let path: String = row.get("path");
+    if mode == JobMode::Subset {
+        let bytes = tokio::fs::read(&path).await?;
+        let decoded = crate::ass::decode_subtitle(&bytes)?;
+        crate::processor::ensure_original_subtitle(&decoded.text)?;
+    }
     let now = Utc::now().to_rfc3339();
     let job_id: Option<i64> = crate::sqlx::query_scalar(
         r#"

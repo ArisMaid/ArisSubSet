@@ -71,17 +71,6 @@ pub fn spawn_controlled_job_loop(mut rx: mpsc::Receiver<i64>, state: Arc<AppStat
                 _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
             }
 
-            if state.conversion_cancel_requested().await {
-                while let Some(job_id) = pending.pop_front() {
-                    let _ = cancel_job(&state, job_id, "cancelled before start").await;
-                }
-                let _ = cancel_queued_jobs(&state).await;
-                if active.is_empty() {
-                    state.clear_conversion_cancel().await;
-                }
-                continue;
-            }
-
             if state.conversion_paused().await {
                 continue;
             }
@@ -103,13 +92,9 @@ pub fn spawn_controlled_job_loop(mut rx: mpsc::Receiver<i64>, state: Arc<AppStat
                     }
                     .await;
                     if let Err(err) = result {
-                        if st.conversion_cancel_requested().await {
-                            let _ = cancel_job(&st, job_id, "cancelled while running").await;
-                        } else {
-                            st.events
-                                .emit("job", "err", format!("job #{job_id} failed: {err:#}"));
-                            let _ = fail_job(&st, job_id, &format!("{err:#}")).await;
-                        }
+                        st.events
+                            .emit("job", "err", format!("job #{job_id} failed: {err:#}"));
+                        let _ = fail_job(&st, job_id, &format!("{err:#}")).await;
                     }
                 });
             }
@@ -186,6 +171,17 @@ struct ProcessStats {
 }
 
 async fn process_job(state: Arc<AppState>, job_id: i64) -> anyhow::Result<()> {
+    // Claim only queued jobs, so cancellation also covers tasks waiting for memory.
+    let claimed = crate::sqlx::query(
+        "UPDATE jobs SET status='running', started_at=? WHERE id=? AND status='queued'",
+    )
+    .bind(Utc::now().to_rfc3339())
+    .bind(job_id)
+    .execute(&state.db.pool)
+    .await?;
+    if claimed.rows_affected() == 0 {
+        return Ok(());
+    }
     let row =
         crate::sqlx::query("SELECT subtitle_id, path, mode, queued_at FROM jobs WHERE id = ?")
             .bind(job_id)
@@ -231,13 +227,12 @@ async fn process_subset_job(
         .events
         .emit("job", "info", format!("开始转换：{path}"));
 
-    if state.conversion_cancel_requested().await {
-        bail!("cancelled");
-    }
     let bytes = read_locked(&path_buf).await?;
     let original_size = bytes.len() as u64;
     let decoded = decode_subtitle(&bytes)?;
     let parsed = parse_subtitle(&decoded.text);
+
+    ensure_original_subtitle(&decoded.text)?;
 
     let mut embedded = Vec::new();
     let mut rename_map = HashMap::new();
@@ -246,9 +241,6 @@ async fn process_subset_job(
     let mut assigned_random_names: HashMap<String, String> = HashMap::new();
 
     for (font_name, usage) in parsed.usages.iter() {
-        if state.conversion_cancel_requested().await {
-            bail!("cancelled");
-        }
         let normalized = normalize_lookup_name(font_name);
         if normalized.starts_with("assdrawsubset") {
             continue;
@@ -417,9 +409,6 @@ async fn process_strip_job(
         .events
         .emit("job", "info", format!("开始清理还原：{path}"));
 
-    if state.conversion_cancel_requested().await {
-        bail!("cancelled");
-    }
     let bytes = read_locked(&path_buf).await?;
     let original_size = bytes.len() as u64;
     let decoded = decode_subtitle(&bytes)?;
@@ -433,9 +422,6 @@ async fn process_strip_job(
     let mut warnings = Vec::new();
 
     for font in &embedded_fonts {
-        if state.conversion_cancel_requested().await {
-            bail!("cancelled");
-        }
         let mut removable = false;
         let family = embedded_family_name(&font.fontname);
         if comment_map.contains_key(&normalize_lookup_name(&family))
@@ -781,7 +767,7 @@ async fn subset_candidate(
                 state.events.emit(
                     "job",
                     "warn",
-                    format!("subset failed, retrying full embed for {original_name}: {err:#}"),
+                    format!("字体 {original_name} 子集化失败，正在尝试整字体嵌入，输出体积可能增大：{err:#}"),
                 );
                 state.workers.subset_font(&fallback_req).await.map(|_| ())
             }
@@ -930,7 +916,21 @@ fn select_best_candidate(candidates: &[FontCandidate], slot: FontSlot) -> Option
     })
 }
 
-async fn write_replace(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+pub fn ensure_original_subtitle(text: &str) -> anyhow::Result<()> {
+    if text
+        .lines()
+        .any(|line| line.trim().eq_ignore_ascii_case("[Fonts]"))
+        || !parse_font_subset_comments(text).is_empty()
+        || text.to_ascii_lowercase().contains("assdrawsubset")
+    {
+        bail!(
+            "字幕已有内嵌字体或子集标记，不能直接重新转换。请先关闭定时扫描、暂停新任务，等待运行任务结束，再恢复原始备份后处理；没有原始备份时请人工检查。"
+        );
+    }
+    Ok(())
+}
+
+pub async fn write_replace(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
         .file_name()
@@ -940,10 +940,17 @@ async fn write_replace(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     tokio::fs::write(&tmp, bytes).await?;
     #[cfg(windows)]
     {
-        if path.exists() {
-            std::fs::remove_file(path)?;
+        use std::os::windows::ffi::OsStrExt;
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
         }
-        std::fs::rename(&tmp, path)?;
+        let source: Vec<u16> = tmp.as_os_str().encode_wide().chain(Some(0)).collect();
+        let target: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        // Replace on the same volume without deleting the destination first.
+        if unsafe { MoveFileExW(source.as_ptr(), target.as_ptr(), 1) } == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
     }
     #[cfg(not(windows))]
     {
@@ -1019,17 +1026,6 @@ async fn fail_job(state: &Arc<AppState>, job_id: i64, error: &str) -> anyhow::Re
                 .emit("job", "warn", format!("failed to write error log: {err:#}"));
         }
     }
-    Ok(())
-}
-
-async fn cancel_job(state: &Arc<AppState>, job_id: i64, message: &str) -> anyhow::Result<()> {
-    let finished = Utc::now().to_rfc3339();
-    crate::sqlx::query("UPDATE jobs SET status='cancelled', finished_at=?, message=? WHERE id=?")
-        .bind(&finished)
-        .bind(message)
-        .bind(job_id)
-        .execute(&state.db.pool)
-        .await?;
     Ok(())
 }
 

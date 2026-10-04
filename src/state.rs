@@ -34,7 +34,6 @@ pub struct AppState {
     conversion_parallelism: RwLock<usize>,
     scan_control: WalkControl,
     conversion_paused: RwLock<bool>,
-    conversion_cancel_requested: RwLock<bool>,
     scan_running: Arc<AtomicBool>,
     index_running: Arc<AtomicBool>,
     scan_progress: RwLock<ScanProgress>,
@@ -46,7 +45,6 @@ pub struct ControlStatus {
     pub scan_paused: bool,
     pub scan_cancel_requested: bool,
     pub conversion_paused: bool,
-    pub conversion_cancel_requested: bool,
     pub conversion_parallelism: usize,
     pub scan_running: bool,
     pub index_running: bool,
@@ -108,7 +106,6 @@ impl AppState {
             conversion_parallelism: RwLock::new(conversion_parallelism),
             scan_control: WalkControl::new(),
             conversion_paused: RwLock::new(false),
-            conversion_cancel_requested: RwLock::new(false),
             scan_running: Arc::new(AtomicBool::new(false)),
             index_running: Arc::new(AtomicBool::new(false)),
             scan_progress: RwLock::new(ScanProgress::default()),
@@ -196,7 +193,6 @@ impl AppState {
             scan_paused: self.scan_control.is_paused(),
             scan_cancel_requested: self.scan_control.is_cancelled(),
             conversion_paused: *self.conversion_paused.read().await,
-            conversion_cancel_requested: *self.conversion_cancel_requested.read().await,
             conversion_parallelism: *self.conversion_parallelism.read().await,
             scan_running: self.scan_running.load(Ordering::Acquire),
             index_running: self.index_running.load(Ordering::Acquire),
@@ -315,22 +311,6 @@ impl AppState {
 
     pub async fn set_conversion_paused(&self, paused: bool) {
         *self.conversion_paused.write().await = paused;
-        if !paused {
-            *self.conversion_cancel_requested.write().await = false;
-        }
-    }
-
-    pub async fn request_conversion_cancel(&self) {
-        *self.conversion_cancel_requested.write().await = true;
-        *self.conversion_paused.write().await = false;
-    }
-
-    pub async fn clear_conversion_cancel(&self) {
-        *self.conversion_cancel_requested.write().await = false;
-    }
-
-    pub async fn conversion_cancel_requested(&self) -> bool {
-        *self.conversion_cancel_requested.read().await
     }
 
     pub async fn conversion_paused(&self) -> bool {

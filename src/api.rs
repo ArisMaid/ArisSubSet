@@ -476,14 +476,13 @@ async fn cancel_conversion(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     auth::require_auth(&state, &headers, true).await?;
-    state.request_conversion_cancel().await;
     let cancelled = processor::cancel_queued_jobs(&state)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     state.events.emit(
         "job",
         "warn",
-        format!("conversion cancel requested, queued jobs cancelled: {cancelled}"),
+        format!("已取消 {cancelled} 个待执行任务；正在运行的任务将继续完成"),
     );
     Ok(Json(
         serde_json::json!({"ok": true, "cancelled": cancelled}),
@@ -905,11 +904,13 @@ async fn retry_job(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(id): Path<i64>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    auth::require_auth(&state, &headers, true).await?;
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    auth::require_auth(&state, &headers, true)
+        .await
+        .map_err(|status| (status, "需要有效登录和 CSRF 凭据".to_string()))?;
     let new_id = scanner::retry_job(&state, id)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|error| (StatusCode::CONFLICT, format!("{error:#}")))?;
     Ok(Json(serde_json::json!({"ok": true, "job_id": new_id})))
 }
 
@@ -917,11 +918,13 @@ async fn process_file(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(id): Path<i64>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    auth::require_auth(&state, &headers, true).await?;
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    auth::require_auth(&state, &headers, true)
+        .await
+        .map_err(|status| (status, "需要有效登录和 CSRF 凭据".to_string()))?;
     let job_id = scanner::enqueue_subtitle_id(&state, id, JobMode::Subset)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|error| (StatusCode::CONFLICT, format!("{error:#}")))?;
     Ok(Json(serde_json::json!({"ok": true, "job_id": job_id})))
 }
 
@@ -992,11 +995,13 @@ async fn restore_backup(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(id): Path<i64>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    auth::require_auth(&state, &headers, true).await?;
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    auth::require_auth(&state, &headers, true)
+        .await
+        .map_err(|status| (status, "需要有效登录和 CSRF 凭据".to_string()))?;
     backup::restore(&state, id)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|error| (StatusCode::CONFLICT, format!("{error:#}")))?;
     Ok(Json(serde_json::json!({"ok": true})))
 }
 
